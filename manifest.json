@@ -1,0 +1,9 @@
+{
+	"id": "dowse",
+	"name": "Dowse",
+	"version": "0.0.1",
+	"minAppVersion": "1.14.4",
+	"description": "Find notes by what they mean, not the exact words. Local semantic search that runs on your computer.",
+	"author": "voyager14",
+	"isDesktopOnly": true
+}

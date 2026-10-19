@@ -1,0 +1,27 @@
+# Local planning and audit notes
+/docs/
+/.audit/
+
+# Dependencies and build output
+node_modules/
+/dist/
+*.tsbuildinfo
+
+# Downloaded model, test vaults, and live-test data
+/dev-assets/
+
+# Python caches from the reference scripts
+__pycache__/
+*.pyc
+
+# Logs and local environment
+*.log
+npm-debug.log*
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,10 @@
+[
+  "query: avoid charging a customer twice",
+  "passage: API reliability\nRetries\nSend an idempotency key with every payment request so a retried request cannot create a second charge.",
+  "passage: Café notes — résumé of naïve Ünïcödé, 東京 and emoji 🚀 handling",
+  "query: C++ templates vs. generics?",
+  "passage: cache-key versus cache key: punctuation matters; e.g. foo_bar-baz.qux(1)!",
+  "query: supercalifragilisticexpialidociousnessinflatedwordthatisverylongindeedandkeepsgoingandgoingwithoutanyspacesatallxyz",
+  "passage:    leading spaces\tand\ttabs\n\nand a blank line",
+  ""
+]
