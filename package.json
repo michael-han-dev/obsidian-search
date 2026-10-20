@@ -8,9 +8,10 @@
   "scripts": {
     "build": "node scripts/build.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "test": "npm run build && node scripts/live/check.ts && node scripts/live/check-m2.ts && node scripts/live/check-everyday.ts",
     "try": "npm run build && node scripts/live/try.ts",
-    "live": "npm run build && node scripts/live/check.ts"
+    "live": "npm run build && node scripts/live/check.ts",
+    "load": "npm run build && node scripts/live/load.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
