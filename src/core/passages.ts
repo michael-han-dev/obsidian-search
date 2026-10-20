@@ -1,6 +1,7 @@
 import { type EncoderSpec, inputHash } from "./encoder-spec.ts";
 import type { TokenId, WordPieceTokenizer } from "./tokenizer.ts";
-import type { MarkdownBlock, Passage, PassageId, SourceDocument } from "./types.ts";
+import { splitLines, textInSpan } from "./markdown.ts";
+import type { Passage, PassageId, SourceDocument, TextSpan } from "./types.ts";
 
 export interface PassagePolicy {
 	readonly maxInputTokens: number;
@@ -15,15 +16,16 @@ export interface EncodablePassage {
 }
 
 interface Piece {
-	readonly block: MarkdownBlock;
-	readonly ids: readonly TokenId[];
+	readonly headingPath: readonly string[];
+	readonly text: string;
+	readonly span: TextSpan;
 }
 
-function splitByLines(block: MarkdownBlock): MarkdownBlock[] {
-	return block.text.split("\n").flatMap((text, offset) => {
+function splitByLines(piece: Piece): Piece[] {
+	return piece.text.split("\n").flatMap((text, offset) => {
 		if (text.trim() === "") return [];
-		const line = block.span.start.line + offset;
-		return [{ headingPath: block.headingPath, text, span: { start: { line, column: 0 }, end: { line, column: text.length } } }];
+		const line = piece.span.start.line + offset;
+		return [{ headingPath: piece.headingPath, text, span: { start: { line, column: 0 }, end: { line, column: text.length } } }];
 	});
 }
 
@@ -34,41 +36,42 @@ export async function buildPassages(
 	policy: PassagePolicy = PASSAGE_POLICY,
 ): Promise<EncodablePassage[]> {
 	const prefix = tokenizer.encode(spec.passagePrefix);
-	const titleIds = tokenizer.encode([doc.title, ...doc.aliases].join(", "));
-	const groups: { pieces: Piece[]; tokens: number; truncated: boolean }[] = [];
+	const titleIds = tokenizer.encode([doc.title, ...doc.metadata.aliases].join(", "));
+	const groups: { pieces: { piece: Piece; ids: readonly TokenId[] }[]; tokens: number; truncated: boolean }[] = [];
 
 	const contextFor = (headingPath: readonly string[]): TokenId[] =>
 		[...titleIds, ...tokenizer.encode(headingPath.join(" > "))].slice(0, policy.maxContextTokens);
 	const budgetFor = (headingPath: readonly string[]): number =>
 		policy.maxInputTokens - 2 - prefix.length - contextFor(headingPath).length;
 
-	const place = (block: MarkdownBlock): void => {
-		const ids = tokenizer.encode(block.text);
-		const budget = budgetFor(block.headingPath);
+	const place = (piece: Piece): void => {
+		const ids = tokenizer.encode(piece.text);
+		const budget = budgetFor(piece.headingPath);
 		if (ids.length > budget) {
-			const lines = splitByLines(block);
+			const lines = splitByLines(piece);
 			if (lines.length > 1) {
 				lines.forEach(place);
 				return;
 			}
-			groups.push({ pieces: [{ block, ids: ids.slice(0, budget) }], tokens: budget, truncated: true });
+			groups.push({ pieces: [{ piece, ids: ids.slice(0, budget) }], tokens: budget, truncated: true });
 			return;
 		}
 		const last = groups.at(-1);
-		const sameSection = last && !last.truncated && last.pieces[0]!.block.headingPath.join("\u0000") === block.headingPath.join("\u0000");
+		const sameSection = last && !last.truncated && last.pieces[0]!.piece.headingPath.join("\u0000") === piece.headingPath.join("\u0000");
 		if (last && sameSection && last.tokens + ids.length <= budget) {
-			last.pieces.push({ block, ids });
+			last.pieces.push({ piece, ids });
 			last.tokens += ids.length;
 			return;
 		}
-		groups.push({ pieces: [{ block, ids }], tokens: ids.length, truncated: false });
+		groups.push({ pieces: [{ piece, ids }], tokens: ids.length, truncated: false });
 	};
-	doc.blocks.forEach(place);
+	const lines = splitLines(doc.text);
+	for (const block of doc.blocks) place({ ...block, text: textInSpan(lines, block.span) });
 
 	return Promise.all(
-		groups.map(async (group, ordinal) => {
-			const first = group.pieces[0]!.block;
-			const last = group.pieces.at(-1)!.block;
+		groups.map(async (group, ordinal): Promise<EncodablePassage> => {
+			const first = group.pieces[0]!.piece;
+			const last = group.pieces.at(-1)!.piece;
 			const input = [tokenizer.clsId, ...prefix, ...contextFor(first.headingPath), ...group.pieces.flatMap((p) => p.ids), tokenizer.sepId];
 			return {
 				input,
@@ -77,9 +80,7 @@ export async function buildPassages(
 					sourceId: doc.sourceId,
 					revision: doc.revision,
 					headingPath: first.headingPath,
-					text: group.pieces.map((p) => p.block.text).join("\n\n"),
 					span: { start: first.span.start, end: last.span.end },
-					truncated: group.truncated,
 					inputHash: await inputHash(input),
 				},
 			};

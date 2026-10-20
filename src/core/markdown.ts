@@ -1,9 +1,14 @@
 import { digest } from "./hash.ts";
-import type { MarkdownBlock, SourceDocument, SourceFile, SourceId } from "./types.ts";
+import type { MarkdownBlock, SourceDocument, SourceFile, SourceId, TextSpan } from "./types.ts";
 
-export const MARKDOWN_ADAPTER_VERSION = "obsidian-markdown@1";
+export const MARKDOWN_ADAPTER_VERSION = "obsidian-markdown@4";
 
-const LINE_BREAK = /\r\n|\r|\n/;
+export const splitLines = (text: string): string[] => text.split(/\r\n|\r|\n/);
+
+export function textInSpan(lines: readonly string[], { start, end }: TextSpan): string {
+	if (start.line === end.line) return lines[start.line - 1]!.slice(start.column, end.column);
+	return [lines[start.line - 1]!.slice(start.column), ...lines.slice(start.line, end.line - 1), lines[end.line - 1]!.slice(0, end.column)].join("\n");
+}
 const HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 const BLANK = /^[ \t]*$/;
@@ -15,7 +20,7 @@ function frontmatterEnd(lines: readonly string[]): number {
 }
 
 export function parseMarkdownBlocks(text: string): MarkdownBlock[] {
-	const lines = text.split(LINE_BREAK);
+	const lines = splitLines(text);
 	const headings: (string | undefined)[] = [];
 	const blocks: MarkdownBlock[] = [];
 	let paragraphStart = -1;
@@ -23,7 +28,6 @@ export function parseMarkdownBlocks(text: string): MarkdownBlock[] {
 	const push = (first: number, last: number): void => {
 		blocks.push({
 			headingPath: headings.filter((h): h is string => h !== undefined),
-			text: lines.slice(first, last + 1).join("\n"),
 			span: { start: { line: first + 1, column: 0 }, end: { line: last + 1, column: lines[last]!.length } },
 		});
 	};
@@ -74,9 +78,9 @@ export async function extractDocument(file: SourceFile): Promise<SourceDocument>
 		sourceId: file.path as SourceId,
 		path: file.path,
 		title: titleFromPath(file.path),
-		aliases: file.aliases,
 		revision: await digest(file.text),
-		adapterVersion: MARKDOWN_ADAPTER_VERSION,
+		metadata: file.metadata,
+		text: file.text,
 		blocks: parseMarkdownBlocks(file.text),
 	};
 }
