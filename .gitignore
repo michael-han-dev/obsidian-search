@@ -1,6 +1,7 @@
 # Local planning and audit notes
 /docs/
 /.audit/
+/AGENTS.md
 
 # Dependencies and build output
 node_modules/
