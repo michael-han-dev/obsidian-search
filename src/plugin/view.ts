@@ -1,12 +1,61 @@
 import { ItemView, MarkdownView, Notice, TFile, type WorkspaceLeaf } from "obsidian";
 import { digest } from "../core/hash.ts";
-import { type ConceptLabel, conceptLabel, type FileResult, type SearchResponse } from "../core/types.ts";
+import { parseQuery } from "../core/query.ts";
+import { type ConceptLabel, conceptLabel, type Digest, type SearchOutcome, type TextSpan } from "../core/types.ts";
 import type { EngineStatus } from "./engine-client.ts";
 import type DowsePlugin from "./main.ts";
 
 export const VIEW_TYPE = "dowse-search";
 const PAUSE_MS = 150;
 const RESULT_LIMIT = 20;
+
+interface Row {
+	readonly path: string;
+	readonly title: string;
+	readonly revision: Digest;
+	readonly headingPath: readonly string[];
+	readonly text: string | null;
+	readonly span: TextSpan | null;
+}
+
+function rowsOf(outcome: SearchOutcome): Row[] {
+	switch (outcome.kind) {
+		case "results":
+			return outcome.files.map(({ path, title, revision, passages: [best] }) => ({ path, title, revision, headingPath: best?.headingPath ?? [], text: best?.text ?? null, span: best?.span ?? null }));
+		case "matching":
+			return outcome.files.map(({ path, title, revision, evidence }) => ({ path, title, revision, headingPath: evidence?.headingPath ?? [], text: evidence?.text ?? null, span: evidence?.span ?? null }));
+		case "empty":
+		case "not-ready":
+		case "invalid":
+			return [];
+		default: {
+			const unhandled: never = outcome;
+			return unhandled;
+		}
+	}
+}
+
+function summaryOf(outcome: SearchOutcome, shown: number): string | null {
+	switch (outcome.kind) {
+		case "invalid":
+			return outcome.error;
+		case "matching":
+			return outcome.total === 0 ? "No notes match these filters." : `Matching files: ${outcome.total}${outcome.total > shown ? `, showing ${shown}` : ""}.`;
+		case "results": {
+			const { embeddedSources, totalSources } = outcome.coverage;
+			if (totalSources === 0) return "No notes match these filters.";
+			const partial = embeddedSources < totalSources ? ` Searched ${embeddedSources} of ${totalSources} notes; the rest are still indexing.` : "";
+			return (shown === 0 ? "No matching notes yet." : "") + partial || null;
+		}
+		case "empty":
+		case "not-ready":
+			return null;
+		default: {
+			const unhandled: never = outcome;
+			return unhandled;
+		}
+	}
+}
 
 const LABEL_TEXT: Record<ConceptLabel, string> = {
 	"model-needed": "Concept search needs a model. Import it in Dowse settings.",
@@ -22,9 +71,11 @@ export class DowseView extends ItemView {
 	private readonly plugin: DowsePlugin;
 	private input!: HTMLInputElement;
 	private statusEl!: HTMLElement;
+	private summaryEl!: HTMLElement;
 	private resultsEl!: HTMLElement;
 	private timer: number | null = null;
-	private files: readonly FileResult[] = [];
+	private rows: readonly Row[] = [];
+	private rendered = 0;
 	private selected = -1;
 	private lastLabel: ConceptLabel | null = null;
 	private lastInputAt = 0;
@@ -51,8 +102,9 @@ export class DowseView extends ItemView {
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("dowse-view");
-		this.input = root.createEl("input", { type: "search", cls: "dowse-input", attr: { placeholder: "Search by meaning", "aria-label": "Search by meaning" } });
+		this.input = root.createEl("input", { type: "search", cls: "dowse-input", attr: { placeholder: "Search by meaning, or filter with tag:, path:, file:", "aria-label": "Search by meaning" } });
 		this.statusEl = root.createDiv({ cls: "dowse-status" });
+		this.summaryEl = root.createDiv({ cls: "dowse-summary" });
 		this.resultsEl = root.createDiv({ cls: "dowse-results" });
 		this.registerDomEvent(this.input, "input", (event) => this.schedule(event.timeStamp));
 		this.registerDomEvent(this.input, "keydown", (event) => this.onKey(event));
@@ -72,14 +124,17 @@ export class DowseView extends ItemView {
 	private schedule(inputAt: number): void {
 		this.lastInputAt = inputAt;
 		if (this.timer !== null) window.clearTimeout(this.timer);
-		this.timer = window.setTimeout(() => void this.run(), PAUSE_MS);
+		const parsed = parseQuery(this.input.value);
+		const wait = parsed.ok && parsed.query.relevance === "" && parsed.query.constraints.length > 0 ? 0 : PAUSE_MS;
+		this.timer = window.setTimeout(() => void this.run(), wait);
 	}
 
 	private async run(): Promise<void> {
 		this.timer = null;
 		const inputAt = this.lastInputAt;
-		const response = await this.plugin.search(this.input.value, RESULT_LIMIT);
-		if (response) this.render(response, inputAt);
+		const text = this.input.value;
+		const response = await this.plugin.search(text, RESULT_LIMIT);
+		if (response) this.render(response, text, inputAt);
 	}
 
 	private showStatus(status: EngineStatus): void {
@@ -94,28 +149,29 @@ export class DowseView extends ItemView {
 		if (becameSearchable && this.input.value.trim() !== "") void this.run();
 	}
 
-	private render(response: SearchResponse, inputAt: number): void {
+	private render(outcome: SearchOutcome, text: string, inputAt: number): void {
 		this.resultsEl.empty();
-		this.files = response.kind === "results" ? response.files : [];
-		this.selected = this.files.length > 0 ? 0 : -1;
-		if (response.kind === "results" && this.files.length === 0) this.resultsEl.createDiv({ cls: "dowse-empty", text: "No matching notes yet." });
-		this.files.forEach((file, index) => {
-			const row = this.resultsEl.createDiv({ cls: "dowse-result", attr: { "data-path": file.path } });
-			row.createDiv({ cls: "dowse-title", text: file.title });
-			row.createDiv({ cls: "dowse-path", text: file.path });
-			const best = file.passages[0];
-			if (best) {
-				if (best.headingPath.length > 0) row.createDiv({ cls: "dowse-heading", text: best.headingPath.join(" › ") });
-				row.createDiv({ cls: "dowse-passage", text: best.text });
-			}
-			this.registerDomEvent(row, "click", () => void this.openResult(index));
+		this.rows = rowsOf(outcome);
+		this.selected = this.rows.length > 0 ? 0 : -1;
+		const summary = summaryOf(outcome, this.rows.length);
+		this.summaryEl.setText(summary ?? "");
+		this.summaryEl.toggleClass("dowse-error", outcome.kind === "invalid");
+		this.rows.forEach((row, index) => {
+			const el = this.resultsEl.createDiv({ cls: "dowse-result", attr: { "data-path": row.path } });
+			el.createDiv({ cls: "dowse-title", text: row.title });
+			el.createDiv({ cls: "dowse-path", text: row.path });
+			if (row.headingPath.length > 0) el.createDiv({ cls: "dowse-heading", text: row.headingPath.join(" › ") });
+			if (row.text !== null) el.createDiv({ cls: "dowse-passage", text: row.text });
+			el.addEventListener("click", () => void this.openResult(index));
 		});
 		this.highlight();
-		this.resultsEl.dataset.generation = String(response.generation);
-		this.resultsEl.dataset.kind = response.kind;
+		this.resultsEl.dataset.generation = String(++this.rendered);
+		this.resultsEl.dataset.kind = outcome.kind;
+		this.resultsEl.dataset.query = text;
+		delete this.resultsEl.dataset.latencyMs;
 		window.requestAnimationFrame(() => {
 			this.resultsEl.dataset.latencyMs = (performance.now() - inputAt).toFixed(1);
-			if (response.kind === "results") this.resultsEl.dataset.embedMs = response.timings.embedMs.toFixed(1);
+			this.resultsEl.dataset.embedMs = outcome.kind === "results" ? outcome.timings.embedMs.toFixed(1) : "0";
 		});
 	}
 
@@ -125,10 +181,10 @@ export class DowseView extends ItemView {
 
 	private onKey(event: KeyboardEvent): void {
 		if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-			if (this.files.length === 0) return;
+			if (this.rows.length === 0) return;
 			event.preventDefault();
 			const step = event.key === "ArrowDown" ? 1 : -1;
-			this.selected = (this.selected + step + this.files.length) % this.files.length;
+			this.selected = (this.selected + step + this.rows.length) % this.rows.length;
 			this.highlight();
 			this.resultsEl.children[this.selected]?.scrollIntoView({ block: "nearest" });
 		} else if (event.key === "Enter" && this.selected >= 0) {
@@ -138,24 +194,19 @@ export class DowseView extends ItemView {
 	}
 
 	private async openResult(index: number): Promise<void> {
-		const result = this.files[index];
-		const file = result && this.app.vault.getAbstractFileByPath(result.path);
-		if (!result || !(file instanceof TFile)) {
+		const row = this.rows[index];
+		const file = row && this.app.vault.getAbstractFileByPath(row.path);
+		if (!row || !(file instanceof TFile)) {
 			new Notice("This note no longer exists.");
 			return;
 		}
 		const current = await digest(await this.app.vault.cachedRead(file));
 		const leaf = this.app.workspace.getLeaf(false);
 		await leaf.openFile(file);
-		const best = result.passages[0];
-		if (current !== result.revision || !best) {
-			if (current !== result.revision) new Notice("This note changed since it was indexed, so it opened at the top.");
-			return;
-		}
-		if (leaf.view instanceof MarkdownView) {
-			const from = { line: best.span.start.line - 1, ch: best.span.start.column };
-			leaf.view.editor.setCursor(from);
-			leaf.view.editor.scrollIntoView({ from, to: { line: best.span.end.line - 1, ch: best.span.end.column } }, true);
-		}
+		if (current !== row.revision) new Notice("This note changed since it was indexed, so it opened at the top.");
+		if (current !== row.revision || !row.span || !(leaf.view instanceof MarkdownView)) return;
+		const from = { line: row.span.start.line - 1, ch: row.span.start.column };
+		leaf.view.editor.setCursor(from);
+		leaf.view.editor.scrollIntoView({ from, to: { line: row.span.end.line - 1, ch: row.span.end.column } }, true);
 	}
 }

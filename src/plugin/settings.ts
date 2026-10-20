@@ -47,12 +47,17 @@ export class DowseSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Candidate encoder")
 			.setDesc(`${E5_SMALL_V2.id} at revision ${E5_SMALL_V2.revision.slice(0, 7)}, ${E5_SMALL_V2.license} license, ${Math.round(E5_SMALL_V2.model.bytes / 1e6)} MB. Status: ${label}.`);
+		const canImport = this.plugin.canImport;
 		const importSetting = new Setting(containerEl)
 			.setName("Import from folder")
-			.setDesc(`A folder containing ${E5_SMALL_V2.model.name} and ${E5_SMALL_V2.vocab.name}. Dowse checks both files against their published checksums before using them.`)
+			.setDesc(
+				canImport
+					? `A folder containing ${E5_SMALL_V2.model.name} and ${E5_SMALL_V2.vocab.name}. Dowse checks both files against their published checksums before using them.`
+					: `A folder containing ${E5_SMALL_V2.model.name} and ${E5_SMALL_V2.vocab.name}. Restart the plugin after deleting local data, then import.`,
+			)
 			.addText((text) => text.setPlaceholder("/path/to/e5-small-v2").setValue(this.folder).onChange((value) => (this.folder = value.trim())));
 		importSetting.addButton((button) =>
-			button.setButtonText("Import").onClick(async () => {
+			button.setButtonText("Import").setDisabled(!canImport).onClick(async () => {
 				button.setDisabled(true);
 				const error = await this.plugin.importModelFrom(this.folder, (done, total) => button.setButtonText(`${Math.round((100 * done) / total)}%`));
 				button.setDisabled(false).setButtonText("Import");

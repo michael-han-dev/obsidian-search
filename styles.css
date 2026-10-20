@@ -9,9 +9,18 @@
 	width: 100%;
 }
 
-.dowse-status {
+.dowse-status,
+.dowse-summary {
 	color: var(--text-muted);
 	font-size: var(--font-ui-smaller);
+}
+
+.dowse-summary:empty {
+	display: none;
+}
+
+.dowse-summary.dowse-error {
+	color: var(--text-error);
 }
 
 .dowse-results {
@@ -50,8 +59,4 @@
 	-webkit-line-clamp: 4;
 	-webkit-box-orient: vertical;
 	overflow: hidden;
-}
-
-.dowse-empty {
-	color: var(--text-faint);
 }

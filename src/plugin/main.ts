@@ -1,6 +1,8 @@
-import { FileSystemAdapter, getFrontMatterInfo, Notice, parseFrontMatterAliases, parseYaml, Plugin, type TAbstractFile, TFile } from "obsidian";
+import { type CachedMetadata, FileSystemAdapter, getAllTags, Notice, parseFrontMatterAliases, Plugin, type TAbstractFile, TFile } from "obsidian";
 import { E5_SMALL_V2 } from "../core/encoder-spec.ts";
-import { type SearchResponse, type SourceFile, VAULT_COLLECTION } from "../core/types.ts";
+import { noteMetadata } from "../core/metadata.ts";
+import { parseQuery } from "../core/query.ts";
+import { type NoteMetadata, type SearchOutcome, type SourceFile, VAULT_COLLECTION } from "../core/types.ts";
 import { EngineClient, type EngineStatus } from "./engine-client.ts";
 import { importModel, loadInstalledModel } from "./model-files.ts";
 import { DowseSettingTab } from "./settings.ts";
@@ -8,15 +10,18 @@ import { dataRoot, deleteAllLocalData, readIndex, vaultIndexDir, writeIndex } fr
 import { DowseView, VIEW_TYPE } from "./view.ts";
 
 const SYNC_DELAY_MS = 300;
+const SYNC_MAX_DELAY_MS = 2000;
+const RECONCILE_MIN_MS = 30_000;
 
-function aliasesFrom(text: string): string[] {
-	const info = getFrontMatterInfo(text);
-	if (!info.exists) return [];
-	try {
-		return parseFrontMatterAliases(parseYaml(info.frontmatter)) ?? [];
-	} catch {
-		return [];
-	}
+const stamp = (file: TFile) => `${file.stat.mtime}:${file.stat.size}`;
+
+// Obsidian's parse, not ours, so tags match native Search.
+function metadataOf(cache: CachedMetadata | null): NoteMetadata {
+	return noteMetadata({
+		aliases: parseFrontMatterAliases(cache?.frontmatter ?? null) ?? [],
+		tags: (cache && getAllTags(cache)) ?? [],
+		frontmatter: cache?.frontmatter ?? {},
+	});
 }
 
 export default class DowsePlugin extends Plugin {
@@ -24,7 +29,12 @@ export default class DowsePlugin extends Plugin {
 	private client: EngineClient | null = null;
 	private indexDir: string | null = null;
 	private readonly statusListeners = new Set<(status: EngineStatus) => void>();
-	private readonly syncTimers = new Map<string, number>();
+	private readonly dirty = new Set<string>();
+	private dirtySince = 0;
+	private flushTimer: number | null = null;
+	private readonly sent = new Map<string, string>();
+	private lastReconcile = 0;
+	private syncing: Promise<void> = Promise.resolve();
 
 	override async onload(): Promise<void> {
 		this.registerView(VIEW_TYPE, (leaf) => new DowseView(leaf, this));
@@ -35,8 +45,9 @@ export default class DowsePlugin extends Plugin {
 	}
 
 	override async onunload(): Promise<void> {
-		for (const timer of this.syncTimers.values()) window.clearTimeout(timer);
-		this.syncTimers.clear();
+		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
+		this.flushTimer = null;
+		this.dirty.clear();
 		this.statusListeners.clear();
 		const client = this.client;
 		this.client = null;
@@ -47,14 +58,21 @@ export default class DowsePlugin extends Plugin {
 		return this.client?.status ?? null;
 	}
 
+	get canImport(): boolean {
+		return this.client !== null;
+	}
+
 	onStatus(listener: (status: EngineStatus) => void): () => void {
 		this.statusListeners.add(listener);
 		if (this.client) listener(this.client.status);
 		return () => this.statusListeners.delete(listener);
 	}
 
-	search(text: string, limit: number): Promise<SearchResponse | null> {
-		return this.client?.search(text, limit) ?? Promise.resolve(null);
+	search(text: string, limit: number): Promise<SearchOutcome | null> {
+		const parsed = parseQuery(text);
+		if (parsed.ok) return this.client?.search(parsed.query, limit) ?? Promise.resolve(null);
+		this.client?.cancel();
+		return Promise.resolve({ kind: "invalid", error: parsed.error });
 	}
 
 	async activateView(): Promise<void> {
@@ -81,16 +99,18 @@ export default class DowsePlugin extends Plugin {
 		const saved = await readIndex(indexDir);
 		if (saved) client.post({ type: "restore", meta: saved.meta, vectors: saved.vectors }, [saved.vectors.buffer]);
 		await this.loadModel();
-		await this.syncAll();
-		this.registerEvent(this.app.vault.on("create", (file) => this.queueSync(file)));
-		this.registerEvent(this.app.vault.on("modify", (file) => this.queueSync(file)));
-		this.registerEvent(this.app.vault.on("delete", (file) => this.client?.post({ type: "remove", paths: [file.path] })));
+		// "changed" carries Obsidian's parse of the new text, so there is no modify handler.
+		this.registerEvent(this.app.metadataCache.on("changed", (file) => this.touch(file.path)));
+		this.registerEvent(this.app.vault.on("create", (file) => this.touchAll(file, file.path)));
+		this.registerEvent(this.app.vault.on("delete", (file) => this.touchAll(file, file.path)));
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
-				this.client?.post({ type: "remove", paths: [oldPath] });
-				this.queueSync(file);
+				this.touchAll(file, oldPath);
+				this.touchAll(file, file.path);
 			}),
 		);
+		this.registerDomEvent(window, "focus", () => this.reconcile());
+		this.serial(() => this.syncAll());
 	}
 
 	private async loadModel(): Promise<boolean> {
@@ -100,28 +120,74 @@ export default class DowsePlugin extends Plugin {
 		return true;
 	}
 
-	private async readSource(file: TFile): Promise<SourceFile> {
+	private async readSource(file: TFile): Promise<{ source: SourceFile; stamp: string }> {
+		const stampAtRead = stamp(file);
 		const text = await this.app.vault.cachedRead(file);
-		return { collectionId: VAULT_COLLECTION, path: file.path, text, aliases: aliasesFrom(text) };
+		return { source: { collectionId: VAULT_COLLECTION, path: file.path, text, metadata: metadataOf(this.app.metadataCache.getFileCache(file)) }, stamp: stampAtRead };
+	}
+
+	// Serial, so a slow read never posts older text after newer text.
+	private serial(operation: () => Promise<void>): void {
+		this.syncing = this.syncing.then(operation).catch((error: unknown) => console.error("Dowse sync failed", error));
 	}
 
 	private async syncAll(): Promise<void> {
-		const files = await Promise.all(this.app.vault.getMarkdownFiles().map((file) => this.readSource(file)));
-		this.client?.post({ type: "sync", files, complete: true });
+		this.sent.clear();
+		this.lastReconcile = Date.now();
+		const read = await Promise.allSettled(this.app.vault.getMarkdownFiles().map((file) => this.readSource(file)));
+		const posted = read.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+		this.client?.post({ type: "sync", files: posted.map((r) => r.source), removed: [], complete: true });
+		for (const r of posted) this.sent.set(r.source.path, r.stamp);
 	}
 
-	private queueSync(file: TAbstractFile): void {
-		if (!(file instanceof TFile) || file.extension !== "md") return;
-		const existing = this.syncTimers.get(file.path);
-		if (existing !== undefined) window.clearTimeout(existing);
-		this.syncTimers.set(
-			file.path,
-			window.setTimeout(async () => {
-				this.syncTimers.delete(file.path);
-				const current = this.app.vault.getAbstractFileByPath(file.path);
-				if (current instanceof TFile) this.client?.post({ type: "sync", files: [await this.readSource(current)], complete: false });
-			}, SYNC_DELAY_MS),
-		);
+	private touch(path: string): void {
+		if (!path.toLowerCase().endsWith(".md")) return;
+		if (this.dirty.size === 0) this.dirtySince = Date.now();
+		this.dirty.add(path);
+		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
+		const wait = Math.max(0, Math.min(SYNC_DELAY_MS, this.dirtySince + SYNC_MAX_DELAY_MS - Date.now()));
+		this.flushTimer = window.setTimeout(() => {
+			this.flushTimer = null;
+			this.serial(() => this.flush());
+		}, wait);
+	}
+
+	private touchAll(file: TAbstractFile, path: string): void {
+		if (file instanceof TFile) return this.touch(path);
+		const prefix = `${path}/`;
+		for (const known of this.sent.keys()) if (known.startsWith(prefix)) this.touch(known);
+		for (const current of this.app.vault.getMarkdownFiles()) if (current.path.startsWith(prefix)) this.touch(current.path);
+	}
+
+	private async flush(): Promise<void> {
+		const paths = [...this.dirty];
+		this.dirty.clear();
+		const removed: string[] = [];
+		const read: { source: SourceFile; stamp: string }[] = [];
+		for (const path of paths) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile && file.extension === "md") {
+				try {
+					read.push(await this.readSource(file));
+				} catch {
+					this.dirty.add(path);
+				}
+			} else removed.push(path);
+		}
+		for (const path of removed) this.sent.delete(path);
+		this.client?.post({ type: "sync", files: read.map((r) => r.source), removed, complete: false });
+		for (const r of read) this.sent.set(r.source.path, r.stamp);
+	}
+
+	private reconcile(): void {
+		if (!this.client || Date.now() - this.lastReconcile < RECONCILE_MIN_MS) return;
+		this.lastReconcile = Date.now();
+		const present = new Set<string>();
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			present.add(file.path);
+			if (this.sent.get(file.path) !== stamp(file)) this.touch(file.path);
+		}
+		for (const path of this.sent.keys()) if (!present.has(path)) this.touch(path);
 	}
 
 	async importModelFrom(folder: string, onProgress: (done: number, total: number) => void): Promise<string | null> {
