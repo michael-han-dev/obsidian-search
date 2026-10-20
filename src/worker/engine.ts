@@ -1,9 +1,10 @@
 import { type EncoderSpec, embeddingFingerprint, encodeQuery } from "../core/encoder-spec.ts";
+import { compileFilter, type DocFilter, matchingFiles } from "../core/filter.ts";
 import { extractDocument, MARKDOWN_ADAPTER_VERSION } from "../core/markdown.ts";
-import { buildPassages, type EncodablePassage, PASSAGE_POLICY, type PassagePolicy } from "../core/passages.ts";
+import { buildPassages, type EncodablePassage, PASSAGE_POLICY } from "../core/passages.ts";
 import { type IndexedSource, searchExact } from "../core/search.ts";
 import { decodeSnapshot, encodeSnapshot } from "../core/snapshot.ts";
-import { createWordPieceTokenizer, type WordPieceTokenizer } from "../core/tokenizer.ts";
+import { createWordPieceTokenizer, type TokenId, type WordPieceTokenizer } from "../core/tokenizer.ts";
 import {
 	type Coverage,
 	conceptLabel,
@@ -22,7 +23,6 @@ import type { FromWorker, ToWorker } from "./protocol.ts";
 interface PendingSource {
 	readonly kind: "pending";
 	readonly doc: SourceDocument;
-	readonly reuse: ReadonlyMap<Digest, Float32Array>;
 	work: EncodablePassage[] | null;
 	vectors: Float32Array;
 	next: number;
@@ -39,32 +39,35 @@ export interface EngineDeps {
 	readonly post: (message: FromWorker, transfer?: Transferable[]) => void;
 	readonly createEncoder: (model: Uint8Array) => Promise<Encoder>;
 	readonly spec: EncoderSpec;
-	readonly policy?: PassagePolicy;
-	readonly snapshotDelayMs?: number;
 }
 
+const SNAPSHOT_DELAY_MS = 2000;
 const yieldToEvents = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 export class Engine {
 	private readonly deps: EngineDeps;
-	private readonly policy: PassagePolicy;
+	private readonly policy = PASSAGE_POLICY;
 	private readonly fingerprint: Promise<Digest>;
+	private readonly extraction: string;
 	private readonly sources = new Map<SourceId, SourceState>();
 	private readonly pending = new Set<SourceId>();
+	private readonly retired = new Map<Digest, Float32Array>();
 	private model: ModelState = { kind: "model-needed" };
 	private encoder: Encoder | null = null;
 	private tokenizer: WordPieceTokenizer | null = null;
 	private query: SearchRequest | null = null;
+	private probe: { readonly texts: readonly string[]; readonly inputs: readonly (readonly number[])[] } | null = null;
 	private running = false;
 	private generation = 0;
+	private passageInferences = 0;
 	private mutations: Promise<void> = Promise.resolve();
 	private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
 	private dirty = false;
 
 	constructor(deps: EngineDeps) {
 		this.deps = deps;
-		this.policy = deps.policy ?? PASSAGE_POLICY;
 		this.fingerprint = embeddingFingerprint(deps.spec);
+		this.extraction = `${MARKDOWN_ADAPTER_VERSION}|${this.policy.maxInputTokens}|${this.policy.maxContextTokens}`;
 	}
 
 	handle(message: ToWorker): void {
@@ -78,23 +81,17 @@ export class Engine {
 			case "load-model":
 				return this.enqueue(() => this.loadModel(message.model, message.vocab));
 			case "sync":
-				return this.enqueue(() => this.sync(message.files, message.complete));
-			case "remove":
-				return this.enqueue(async () => this.remove(message.paths));
+				return this.enqueue(() => this.sync(message.files, message.removed, message.complete));
 			case "dispose":
 				return this.enqueue(() => this.dispose());
+			case "probe":
+				this.probe = message;
+				void this.pump();
+				return;
 			default: {
 				const unhandled: never = message;
 				throw new Error(`Unknown message ${JSON.stringify(unhandled)}`);
 			}
-		}
-	}
-
-	async idle(): Promise<void> {
-		for (;;) {
-			await this.mutations;
-			if (!this.running && this.query === null && (this.pending.size === 0 || !this.encoder)) return;
-			await yieldToEvents();
 		}
 	}
 
@@ -110,7 +107,7 @@ export class Engine {
 	}
 
 	private publish(): void {
-		this.deps.post({ type: "state", model: this.model, coverage: this.coverage(), indexGeneration: this.generation as IndexGeneration });
+		this.deps.post({ type: "state", model: this.model, coverage: this.coverage(), indexGeneration: this.generation as IndexGeneration, passageInferences: this.passageInferences });
 	}
 
 	private fail(error: unknown): void {
@@ -121,14 +118,11 @@ export class Engine {
 
 	private async restore(meta: string, vectors: Float32Array): Promise<void> {
 		const snapshot = decodeSnapshot(meta, vectors, this.deps.spec.dimensions);
-		const compatible =
-			snapshot &&
-			snapshot.fingerprint === (await this.fingerprint) &&
-			snapshot.adapterVersion === MARKDOWN_ADAPTER_VERSION &&
-			snapshot.policy.maxInputTokens === this.policy.maxInputTokens &&
-			snapshot.policy.maxContextTokens === this.policy.maxContextTokens;
-		if (!compatible) return;
-		for (const indexed of snapshot.sources) this.sources.set(indexed.sourceId, { kind: "embedded", indexed });
+		if (!snapshot || snapshot.fingerprint !== (await this.fingerprint)) return;
+		for (const indexed of snapshot.sources) {
+			if (snapshot.extraction === this.extraction) this.sources.set(indexed.doc.sourceId, { kind: "embedded", indexed });
+			else this.retire({ kind: "embedded", indexed });
+		}
 		this.generation++;
 		this.publish();
 	}
@@ -142,36 +136,39 @@ export class Engine {
 		this.publish();
 	}
 
-	private async sync(files: readonly SourceFile[], complete: boolean): Promise<void> {
+	// Removals ride in the same message so a rename's two halves land together and reuse vectors.
+	private async sync(files: readonly SourceFile[], removed: readonly string[], complete: boolean): Promise<void> {
 		const seen = new Set<SourceId>();
 		let changed = false;
 		for (const file of files) {
 			const doc = await extractDocument(file);
 			seen.add(doc.sourceId);
 			const existing = this.sources.get(doc.sourceId);
-			const current = existing?.kind === "embedded" ? existing.indexed.revision : existing?.doc.revision;
-			if (current === doc.revision) continue;
-			this.sources.set(doc.sourceId, { kind: "pending", doc, reuse: reusableVectors(existing, this.deps.spec.dimensions), work: null, vectors: new Float32Array(0), next: 0 });
+			const current = existing?.kind === "embedded" ? existing.indexed.doc : existing?.doc;
+			if (current && current.revision === doc.revision && JSON.stringify(current.metadata) === JSON.stringify(doc.metadata)) continue;
+			if (existing) this.retire(existing);
+			this.sources.set(doc.sourceId, { kind: "pending", doc, work: null, vectors: new Float32Array(0), next: 0 });
 			this.pending.add(doc.sourceId);
 			changed = true;
 		}
-		if (complete) {
-			for (const id of this.sources.keys()) {
-				if (!seen.has(id)) changed = this.drop(id) || changed;
-			}
-		}
-		if (changed) this.changed();
-	}
-
-	private remove(paths: readonly string[]): void {
-		let changed = false;
-		for (const path of paths) changed = this.drop(path as SourceId) || changed;
+		for (const id of complete ? [...this.sources.keys()].filter((id) => !seen.has(id)) : (removed as SourceId[])) changed = this.drop(id) || changed;
+		if (this.pending.size === 0) this.retired.clear();
 		if (changed) this.changed();
 	}
 
 	private drop(id: SourceId): boolean {
+		const state = this.sources.get(id);
+		if (!state) return false;
+		this.retire(state);
 		this.pending.delete(id);
 		return this.sources.delete(id);
+	}
+
+	private retire(state: SourceState): void {
+		const dimensions = this.deps.spec.dimensions;
+		const done = state.kind === "embedded" ? state.indexed.passages : (state.work?.slice(0, state.next).map((w) => w.passage) ?? []);
+		const vectors = state.kind === "embedded" ? state.indexed.vectors : state.vectors;
+		done.forEach((p, i) => this.retired.set(p.inputHash, vectors.slice(i * dimensions, (i + 1) * dimensions)));
 	}
 
 	private changed(): void {
@@ -197,7 +194,13 @@ export class Engine {
 		try {
 			for (;;) {
 				const query = this.query;
-				if (query) {
+				const { probe, encoder, tokenizer } = this;
+				if (probe && encoder && tokenizer) {
+					this.probe = null;
+					const vectors: Float32Array[] = [];
+					for (const input of probe.inputs) vectors.push(await encoder.embed(input as TokenId[]));
+					this.deps.post({ type: "probed", ids: probe.texts.map((t) => tokenizer.encode(t)), vectors });
+				} else if (query) {
 					this.query = null;
 					this.deps.post({ type: "response", response: await this.answer(query) });
 				} else if (this.encoder && this.pending.size > 0) {
@@ -215,23 +218,42 @@ export class Engine {
 		this.scheduleSnapshot();
 	}
 
-	private async answer(request: SearchRequest): Promise<SearchResponse> {
-		const coverage = this.coverage();
-		if (request.text.trim() === "") return { kind: "empty", generation: request.generation };
-		const { encoder, tokenizer } = this;
-		if (!encoder || !tokenizer) return { kind: "not-ready", generation: request.generation, label: conceptLabel(this.model, coverage), coverage };
+	private async answer({ generation, query, limit }: SearchRequest): Promise<SearchResponse> {
+		if (query.constraints.length === 0 && query.relevance === "") return { kind: "empty", generation };
 		const started = performance.now();
-		const vector = await encoder.embed(encodeQuery(tokenizer, this.deps.spec, request.text));
+		if (query.relevance === "") {
+			const { files, total } = matchingFiles(this.documents(), query.constraints, limit);
+			return { kind: "matching", generation, indexGeneration: this.generation as IndexGeneration, files, total, timings: { searchMs: performance.now() - started } };
+		}
+		const { encoder, tokenizer } = this;
+		if (!encoder || !tokenizer) return { kind: "not-ready", generation, label: conceptLabel(this.model, this.coverage()), coverage: this.coverage() };
+		const vector = await encoder.embed(encodeQuery(tokenizer, this.deps.spec, query.relevance));
 		const embedded = performance.now();
-		const files = searchExact(this.embeddedSources(), vector, request.limit);
+		// No await below: the response must describe one state of the index.
+		const eligible = this.eligible(compileFilter(query.constraints));
 		return {
 			kind: "results",
-			generation: request.generation,
+			generation,
 			indexGeneration: this.generation as IndexGeneration,
-			coverage,
-			files,
+			coverage: eligible.coverage,
+			files: searchExact(eligible.embedded, vector, limit),
 			timings: { embedMs: embedded - started, searchMs: performance.now() - embedded },
 		};
+	}
+
+	private *documents(): Iterable<SourceDocument> {
+		for (const state of this.sources.values()) yield state.kind === "embedded" ? state.indexed.doc : state.doc;
+	}
+
+	private eligible(filter: DocFilter): { embedded: IndexedSource[]; coverage: Coverage } {
+		const embedded: IndexedSource[] = [];
+		let total = 0;
+		for (const state of this.sources.values()) {
+			if (!filter(state.kind === "embedded" ? state.indexed.doc : state.doc)) continue;
+			total++;
+			if (state.kind === "embedded") embedded.push(state.indexed);
+		}
+		return { embedded, coverage: { embeddedSources: embedded.length, totalSources: total } };
 	}
 
 	private *embeddedSources(): Iterable<IndexedSource> {
@@ -250,48 +272,30 @@ export class Engine {
 		}
 		while (state.next < state.work.length) {
 			const item = state.work[state.next]!;
-			const reused = state.reuse.get(item.passage.inputHash);
+			const reused = this.retired.get(item.passage.inputHash);
+			if (!reused) this.passageInferences++;
 			const vector = reused ?? (await encoder.embed(item.input));
 			if (this.sources.get(id) !== state) return;
 			state.vectors.set(vector, state.next * dimensions);
 			state.next++;
 			if (!reused) return;
 		}
-		const { doc } = state;
-		this.sources.set(id, {
-			kind: "embedded",
-			indexed: { sourceId: doc.sourceId, path: doc.path, title: doc.title, revision: doc.revision, passages: state.work.map((w) => w.passage), vectors: state.vectors },
-		});
+		this.sources.set(id, { kind: "embedded", indexed: { doc: state.doc, passages: state.work.map((w) => w.passage), vectors: state.vectors } });
 		this.pending.delete(id);
+		if (this.pending.size === 0) this.retired.clear();
 		this.changed();
 	}
 
 	private scheduleSnapshot(): void {
 		if (!this.dirty || this.snapshotTimer || this.pending.size > 0 || this.model.kind === "disabled") return;
-		this.snapshotTimer = setTimeout(() => void this.postSnapshot(), this.deps.snapshotDelayMs ?? 2000);
+		this.snapshotTimer = setTimeout(() => void this.postSnapshot(), SNAPSHOT_DELAY_MS);
 	}
 
 	private async postSnapshot(): Promise<void> {
 		this.snapshotTimer = null;
 		if (this.pending.size > 0 || this.model.kind === "disabled") return;
 		this.dirty = false;
-		const encoded = encodeSnapshot({
-			fingerprint: await this.fingerprint,
-			adapterVersion: MARKDOWN_ADAPTER_VERSION,
-			policy: this.policy,
-			sources: [...this.embeddedSources()],
-		});
+		const encoded = encodeSnapshot({ fingerprint: await this.fingerprint, extraction: this.extraction, sources: [...this.embeddedSources()] });
 		this.deps.post({ type: "snapshot", meta: encoded.meta, vectors: encoded.vectors }, [encoded.vectors.buffer]);
 	}
-}
-
-function reusableVectors(state: SourceState | undefined, dimensions: number): ReadonlyMap<Digest, Float32Array> {
-	const reuse = new Map<Digest, Float32Array>();
-	if (state?.kind === "embedded") {
-		state.indexed.passages.forEach((p, i) => reuse.set(p.inputHash, state.indexed.vectors.slice(i * dimensions, (i + 1) * dimensions)));
-	} else if (state?.work) {
-		for (let i = 0; i < state.next; i++) reuse.set(state.work[i]!.passage.inputHash, state.vectors.slice(i * dimensions, (i + 1) * dimensions));
-		for (const [hash, vector] of state.reuse) if (!reuse.has(hash)) reuse.set(hash, vector);
-	}
-	return reuse;
 }
