@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { CDPSession, Page } from "playwright-core";
 import { ENCODER } from "../../src/core/encoder-spec.ts";
@@ -106,7 +107,7 @@ try {
 	step("setup facts", facts);
 	expect(
 		"the setup screen shows model, license, actual size, storage, and network use",
-		facts.includes(ENCODER.id) && facts.includes(`${ENCODER.license} license`) && facts.includes(`${totalMb} MB from huggingface.co`) && facts.includes(live.dataDir) && facts.includes("Only this download"),
+		facts.includes(ENCODER.id) && facts.includes(`${ENCODER.license} license`) && facts.includes(`${totalMb} MB from huggingface.co`) && facts.includes(live.dataDir.replace(homedir(), "~")) && facts.includes("Only this download"),
 		facts,
 	);
 
