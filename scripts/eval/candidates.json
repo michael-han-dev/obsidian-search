@@ -1,0 +1,13 @@
+[
+	{ "name": "e5-small-v2", "repo": "intfloat/e5-small-v2", "revision": "ffb93f3bd4047442299a41ebb6fa998a38507c52", "onnx": "model.onnx", "queryPrefix": "query: ", "passagePrefix": "passage: " },
+	{ "name": "bge-small-en-v1.5", "repo": "BAAI/bge-small-en-v1.5", "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a", "onnx": "onnx/model.onnx", "queryPrefix": "Represent this sentence for searching relevant passages: ", "passagePrefix": "" },
+	{ "name": "gte-small", "repo": "thenlper/gte-small", "revision": "17e1f347d17fe144873b1201da91788898c639cd", "onnx": "onnx/model.onnx", "queryPrefix": "", "passagePrefix": "" },
+	{ "name": "arctic-embed-s", "repo": "Snowflake/snowflake-arctic-embed-s", "revision": "e596f507467533e48a2e17c007f0e1dacc837b33", "onnx": "onnx/model.onnx", "queryPrefix": "Represent this sentence for searching relevant passages: ", "passagePrefix": "" },
+	{ "name": "arctic-embed-xs", "repo": "Snowflake/snowflake-arctic-embed-xs", "revision": "d8c86521100d3556476a063fc2342036d45c106f", "onnx": "onnx/model.onnx", "queryPrefix": "Represent this sentence for searching relevant passages: ", "passagePrefix": "" },
+	{ "name": "all-MiniLM-L6-v2", "repo": "sentence-transformers/all-MiniLM-L6-v2", "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41", "onnx": "onnx/model.onnx", "queryPrefix": "", "passagePrefix": "" },
+	{ "name": "mxbai-embed-xsmall-v1", "repo": "mixedbread-ai/mxbai-embed-xsmall-v1", "revision": "e6ac24e5d6efb8782b59de1647b3ececb4ece94e", "onnx": "onnx/model.onnx", "queryPrefix": "", "passagePrefix": "" },
+	{ "name": "bge-base-en-v1.5", "repo": "BAAI/bge-base-en-v1.5", "revision": "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a", "onnx": "onnx/model.onnx", "queryPrefix": "Represent this sentence for searching relevant passages: ", "passagePrefix": "" },
+	{ "name": "arctic-embed-m-v1.5", "repo": "Snowflake/snowflake-arctic-embed-m-v1.5", "revision": "e58a8f756156a1293d763f17e3aae643474e9b8a", "onnx": "onnx/model.onnx", "queryPrefix": "Represent this sentence for searching relevant passages: ", "passagePrefix": "" },
+	{ "name": "e5-base-v2", "repo": "intfloat/e5-base-v2", "revision": "f52bf8ec8c7124536f0efb74aca902b2995e5bcd", "onnx": "onnx/model.onnx", "queryPrefix": "query: ", "passagePrefix": "passage: " },
+	{ "name": "nomic-embed-text-v1.5", "repo": "nomic-ai/nomic-embed-text-v1.5", "revision": "e9b6763023c676ca8431644204f50c2b100d9aab", "onnx": "onnx/model.onnx", "queryPrefix": "search_query: ", "passagePrefix": "search_document: " }
+]
