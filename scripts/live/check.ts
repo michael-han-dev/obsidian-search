@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { Page } from "playwright-core";
 import { HOSTILE_PATH, QUERIES } from "../../test/fixtures/vault.ts";
-import { captureConsole, engineStatus, launch, liveRoot, OFFLINE_ARGS, openPane, pluginLoaded, prepare, search, type Session, statusOf, typeInPane, userGuard, waitForLabel, writeFixture } from "./harness.ts";
+import { ENCODER } from "../../src/core/encoder-spec.ts";
+import { captureConsole, closeModal, engineStatus, importInSetup, launch, liveRoot, OFFLINE_ARGS, openPane, openSetup, pluginLoaded, prepare, search, type Session, statusOf, typeInPane, userGuard, waitForLabel, waitForSetup, writeFixture } from "./harness.ts";
 import { createReport, walk } from "./report.ts";
 
 const live = liveRoot(resolve(process.argv[2] ?? "dev-assets/live"));
@@ -32,12 +33,12 @@ async function attach(session: Session) {
 
 const dataFiles = async () => (await walk(live.dataDir)).map((f) => relative(live.dataDir, f).replace(/vectors-[\w-]+/, "vectors-<id>").replace(/vault-[0-9a-f]{16}/, "vault-<hash>")).sort();
 
-async function importFrom(settings: Page, folder: string, notice: string): Promise<number> {
-	await settings.locator(".vertical-tab-content input[type=text]").fill(folder);
+async function importFrom(page: Page, folder: string, settled: (state: { label: string; text: string }) => boolean): Promise<{ ms: number; state: { label: string; text: string } }> {
 	const started = Date.now();
-	await settings.locator(".vertical-tab-content button", { hasText: "Import" }).click();
-	await settings.waitForFunction((want) => Array.from(document.querySelectorAll(".notice")).some((n) => n.textContent?.includes(want)), notice, { timeout: 120000 });
-	return Date.now() - started;
+	await importInSetup(page, folder);
+	await page.waitForTimeout(100);
+	const state = await waitForSetup(page, settled);
+	return { ms: Date.now() - started, state };
 }
 
 async function openDowseSettings(session: Session): Promise<Page> {
@@ -95,20 +96,23 @@ try {
 	await openPane(page);
 	await waitForLabel(page, ["model-needed"]);
 	await page.screenshot({ path: join(out, "01-model-needed.png") });
-	expect("pane asks for a model", (await statusOf(page)).text === "Concept search needs a model. Import it in Dowse settings.", await statusOf(page));
+	expect("pane asks for a one-time setup", (await statusOf(page)).text === "Concept search needs a one-time model setup. Filters already work.", await statusOf(page));
 	expect("the engine runs in a worker", [...liveWorkers.values()].includes("dowse-engine"), [...liveWorkers.values()]);
 	await page.locator(".dowse-input").fill("sourdough");
 	await page.waitForTimeout(600);
 	expect("search before a model answers not-ready", (await page.evaluate(() => (document.querySelector(".dowse-results") as HTMLElement).dataset.kind)) === "not-ready");
 
-	const settings = await openDowseSettings(session);
-	await importFrom(settings, missingModel, `model.onnx is missing from ${missingModel}`);
-	await importFrom(settings, corruptModel, "model.onnx does not match the published SHA-256 checksum");
+	await openSetup(page);
+	await page.screenshot({ path: join(out, "02-setup.png") });
+	const missing = await importFrom(page, missingModel, (s) => s.label === "failed");
+	expect("importing from a folder without the model says so", missing.state.text.startsWith(`model.onnx is missing from ${missingModel}`), missing.state);
+	const corrupt = await importFrom(page, corruptModel, (s) => s.label === "failed" && s.text.includes("checksum"));
+	expect("importing a model with one flipped byte fails its checksum", corrupt.state.text.startsWith("model.onnx does not match the published SHA-256 checksum"), corrupt.state);
 	expect("rejected imports install nothing", (await walk(join(live.dataDir, "models"))).length === 0, await walk(join(live.dataDir, "models")));
-	await settings.screenshot({ path: join(out, "02-settings.png") });
-	step("import ms", await importFrom(settings, live.modelSource, "Model imported"));
-	await settings.screenshot({ path: join(out, "02b-imported.png") });
-	await page.evaluate(() => (window as any).app.setting.close());
+	const good = await importFrom(page, live.modelSource, (s) => s.label === "ready" || s.label === "indexing");
+	step("import to searchable ms", good.ms);
+	await page.screenshot({ path: join(out, "02b-imported.png") });
+	await closeModal(page);
 	step("model load plus first indexing ms", await waitForLabel(page, ["ready"], 300000));
 	expect("every note is searchable", (await statusOf(page)).text === `Ready. ${noteCount} of ${noteCount} notes searchable.`, await statusOf(page));
 	await page.screenshot({ path: join(out, "03-ready.png") });
@@ -198,7 +202,7 @@ try {
 	const pluginFiles = (await walk(join(live.vault, ".obsidian", "plugins", "dowse"))).map((f) => relative(live.vault, f)).sort();
 	expect("the vault holds only notes and Obsidian config", strayVaultFiles.length === 0, strayVaultFiles);
 	expect("the plugin folder holds only the release files", JSON.stringify(pluginFiles) === JSON.stringify([".obsidian/plugins/dowse/main.js", ".obsidian/plugins/dowse/manifest.json", ".obsidian/plugins/dowse/styles.css"]), pluginFiles);
-	const expectedData = ["models/intfloat-e5-small-v2-ffb93f3/model.onnx", "models/intfloat-e5-small-v2-ffb93f3/vocab.txt", "vaults/vault-<hash>/index.json", "vaults/vault-<hash>/vectors-<id>.f32"];
+	const expectedData = [`models/${ENCODER.folderName}/${ENCODER.model.name}`, `models/${ENCODER.folderName}/${ENCODER.vocab.name}`, "vaults/vault-<hash>/index.json", "vaults/vault-<hash>/vectors-<id>.f32"].sort();
 	expect("the data folder holds the model and one index with one vectors file", JSON.stringify(await dataFiles()) === JSON.stringify(expectedData), await dataFiles());
 	await session.close();
 
@@ -360,16 +364,16 @@ try {
 	const deleteSettings = await openDowseSettings(session);
 	await deleteSettings.locator(".setting-item button", { hasText: "Delete local data" }).click();
 	await deleteSettings.getByRole("button", { name: "Delete", exact: true }).click();
-	let importDisabled = false;
-	for (let i = 0; i < 100 && !importDisabled; i++) {
+	let setupDisabled = false;
+	for (let i = 0; i < 100 && !setupDisabled; i++) {
 		await deleteSettings.waitForTimeout(100);
-		importDisabled = await deleteSettings.evaluate(() => {
-			const buttons = Array.from(document.querySelectorAll("button")).filter((b) => b.textContent === "Import");
-			return buttons.length === 1 && buttons[0]!.disabled;
+		setupDisabled = await deleteSettings.evaluate(() => {
+			const buttons = Array.from(document.querySelectorAll(".vertical-tab-content button")).filter((b) => b.textContent === "Show setup" || b.textContent === "Set up concept search");
+			return buttons.length === 1 && (buttons[0] as HTMLButtonElement).disabled;
 		});
 	}
 	await page.screenshot({ path: join(out, "06-after-delete.png") });
-	expect("after deleting local data the Import button waits for the plugin restart", importDisabled, importDisabled);
+	expect("after deleting local data the setup button waits for the plugin restart", setupDisabled, setupDisabled);
 	await session.close();
 
 	const unexpected = consoleErrors.filter((e) => !e.includes("ERR_PROXY_CONNECTION_FAILED"));

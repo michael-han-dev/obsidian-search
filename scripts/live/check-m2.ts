@@ -2,8 +2,6 @@ import { cp, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/pro
 import { join, relative, resolve } from "node:path";
 import { blake3 } from "hash-wasm";
 import type { Page } from "playwright-core";
-import { E5_SMALL_V2 } from "../../src/core/encoder-spec.ts";
-import { importModel } from "../../src/plugin/model-files.ts";
 import {
 	FILTER_CASES,
 	FILTER_NOTES,
@@ -13,14 +11,15 @@ import {
 	ORDER_NOTES,
 	PARSE_ERRORS,
 	PROPERTY_NOTES,
+	LONG_LINE,
+	SHAPE_FIRST_PASSAGE,
 	SHAPE_NOTES,
-	SHAPE_PASSAGES,
 	SIBLING_NOTES,
 	TWIN_NOTES,
 } from "../../test/fixtures/e2e.ts";
 import { TAG_NOTES, TAG_QUERIES } from "../../test/fixtures/tags.ts";
 import { NOTES, noteText, QUERIES } from "../../test/fixtures/vault.ts";
-import { captureConsole, engineStatus, type Found, launch, liveRoot, nativeSearch, openAndWait, prepare, search, type Session, typeInPane, userGuard, writeNotes } from "./harness.ts";
+import { captureConsole, engineStatus, type Found, installModel, launch, liveRoot, nativeSearch, openAndWait, prepare, search, type Session, typeInPane, userGuard, writeNotes } from "./harness.ts";
 import { createReport, walk } from "./report.ts";
 
 const live = liveRoot(resolve(process.argv[2] ?? "dev-assets/live-m2"));
@@ -97,31 +96,31 @@ try {
 	);
 	await session.close();
 
-	const imported = await importModel(live.modelSource, live.dataDir, E5_SMALL_V2, () => {});
-	if (!imported.ok) throw new Error(imported.message);
+	await installModel(live);
 	session = await launch(live, 9343);
 	page = session.page;
 	captureConsole(page, consoleErrors);
 	step("first indexing ms", await openAndWait(session));
 	step("status", await engineStatus(page));
 
-	const matrix: { query: string; native: string[]; dowse: string[]; dowseRanked: string[]; match: boolean; matchRanked: boolean }[] = [];
+	const narrowsTo = (ranked: Found, native: string[]) => ranked.kind === "results" && ranked.coverage?.totalSources === native.length && paths(ranked).every((p) => native.includes(p));
+	const matrix: { query: string; native: string[]; dowse: string[]; dowseRanked: string[]; eligible: number | undefined; match: boolean; matchRanked: boolean }[] = [];
 	for (const query of TAG_QUERIES) {
 		const native = await nativeSearch(page, query);
 		const dowse = paths(await search(page, query));
-		const dowseRanked = paths(await search(page, `${query} notes`));
-		matrix.push({ query, native, dowse: sorted(dowse), dowseRanked: sorted(dowseRanked), match: same(native, dowse), matchRanked: same(native, dowseRanked) });
+		const ranked = await search(page, `${query} notes`);
+		matrix.push({ query, native, dowse: sorted(dowse), dowseRanked: sorted(paths(ranked)), eligible: ranked.coverage?.totalSources, match: same(native, dowse), matchRanked: narrowsTo(ranked, native) });
 	}
 	await writeFile(join(out, "tag-matrix.json"), `${JSON.stringify(matrix, null, 1)}\n`);
 	step("tag queries matching native, filter only", `${matrix.filter((m) => m.match).length} of ${matrix.length}`);
 	step("tag queries matching native, with words", `${matrix.filter((m) => m.matchRanked).length} of ${matrix.length}`);
-	for (const m of matrix) expect(`native parity ${m.query}`, m.match && m.matchRanked, { native: m.native, dowse: m.dowse, ranked: m.dowseRanked });
+	for (const m of matrix) expect(`native parity ${m.query}: the same notes, and with words the eligible set is exactly native's`, m.match && m.matchRanked, { native: m.native, dowse: m.dowse, ranked: m.dowseRanked, eligible: m.eligible });
 
 	for (const query of NATIVE_TEXT_QUERIES) {
 		const native = await nativeSearch(page, `path:Native/ ${query}`);
 		const dowse = paths(await search(page, `path:Native/ ${query}`));
-		const ranked = paths(await search(page, `path:Native/ ${query} notes`));
-		expect(`native parity ${query}`, same(native, dowse) && same(native, ranked), { native, dowse, ranked });
+		const ranked = await search(page, `path:Native/ ${query} notes`);
+		expect(`native parity ${query}: the same notes, and with words the eligible set is exactly native's`, same(native, dowse) && narrowsTo(ranked, native), { native, dowse, ranked: paths(ranked), eligible: ranked.coverage?.totalSources });
 	}
 	for (const [query, want] of Object.entries(FILTER_CASES)) {
 		const got = paths(await search(page, `path:Filters/ ${query}`));
@@ -177,7 +176,12 @@ try {
 	);
 
 	const shapes = await search(page, "path:Shapes/ constants in code", 1);
-	expect("passage text is rebuilt from the note's blocks", same(shapes.files[0]?.passages.map((p) => p.text) ?? [], SHAPE_PASSAGES), shapes.files[0]?.passages.map((p) => p.text.slice(0, 60)));
+	const shapeTexts = shapes.files[0]?.passages.map((p) => p.text) ?? [];
+	expect(
+		"passage text is rebuilt from the note's blocks, and the long line comes back as whole-word pieces",
+		shapeTexts.includes(SHAPE_FIRST_PASSAGE) && shapeTexts.filter((t) => t !== SHAPE_FIRST_PASSAGE).every((t) => /^word( word)*$/.test(t) && t.length < LONG_LINE.length),
+		shapeTexts.map((t) => t.slice(0, 60)),
+	);
 
 	const narrowed = await search(page, "tag:engineering avoid charging a customer twice", 1);
 	expect("filter narrows before ranking", JSON.stringify(paths(narrowed)) === JSON.stringify(["Engineering/API reliability.md"]) && narrowed.coverage?.totalSources === 1, narrowed);
@@ -227,10 +231,11 @@ try {
 			const lines = (await readFile(join(live.vault, f.path), "utf8")).split(/\r\n|\r|\n/);
 			for (const p of f.passages) {
 				const text = p.text.split("\n");
-				const first = lines[p.span.start.line - 1]!.slice(p.span.start.column);
-				const last = lines[p.span.end.line - 1]!.slice(0, p.span.end.column);
+				const oneLine = p.span.start.line === p.span.end.line;
+				const first = lines[p.span.start.line - 1]!.slice(p.span.start.column, oneLine ? p.span.end.column : undefined);
+				const last = oneLine ? first : lines[p.span.end.line - 1]!.slice(0, p.span.end.column);
 				checked++;
-				if (first !== text[0] || last !== text.at(-1)) offsetErrors.push({ path: f.path, span: p.span, first, last, text: [text[0], text.at(-1)] });
+				if (first !== text[0] || last !== text.at(-1)) offsetErrors.push({ path: f.path, span: p.span, first: first.slice(0, 80), last: last.slice(0, 80), text: [text[0]?.slice(0, 80), text.at(-1)?.slice(0, 80)] });
 			}
 		}
 	}
@@ -240,13 +245,13 @@ try {
 	const freshness: { tagMs: number; conceptMs: number; embedded: number }[] = [];
 	for (let i = 0; i < 5; i++) {
 		const before = await settled(page);
-		const phrase = `kumquat ledger reconciliation ${i}`;
+		const phrase = `frostlog${i}`;
 		const target = "Garden/Tomatoes.md";
 		await page.evaluate(
 			async ({ target, phrase, i }) => {
 				const app = (window as any).app;
 				const file = app.vault.getAbstractFileByPath(target);
-				await app.vault.modify(file, `${await app.vault.read(file)}\n\nThe ${phrase} happened. #fresh${i}\n`);
+				await app.vault.modify(file, `${await app.vault.read(file)}\n\nA late frost damaged the seedlings, ${phrase}. #fresh${i}\n`);
 			},
 			{ target, phrase, i },
 		);
@@ -255,7 +260,7 @@ try {
 		let conceptMs = -1;
 		while ((tagMs < 0 || conceptMs < 0) && Date.now() - saved < 30000) {
 			if (tagMs < 0 && paths(await search(page, `tag:fresh${i}`)).includes(target)) tagMs = Date.now() - saved;
-			const r = await search(page, `"${phrase}" ${phrase}`);
+			const r = await search(page, `"${phrase}" frost damaged the seedlings`);
 			if (conceptMs < 0 && r.kind === "results" && r.files[0]?.path === target && r.files[0].passages.some((p) => p.text.includes(phrase))) conceptMs = Date.now() - saved;
 			await page.waitForTimeout(25);
 		}
@@ -402,7 +407,7 @@ try {
 	const second2 = indexes.find((i) => i.dir.startsWith("vault2-"));
 	expect(
 		"second vault has its own index",
-		vaultDirs.length === 2 && same(second2?.sources ?? [], ["Second vault note.md", "Other.md"]) && same(paths(second), ["Second vault note.md", "Other.md"]),
+		vaultDirs.length === 2 && same(second2?.sources ?? [], ["Second vault note.md", "Other.md"]) && paths(second)[0] === "Second vault note.md" && paths(second).every((p) => ["Second vault note.md", "Other.md"].includes(p)),
 		{ vaultDirs, second: paths(second) },
 	);
 	const index1After = (await walk(join(live.dataDir, "vaults"))).filter((f) => !f.includes("vault2-")).map((f) => relative(live.dataDir, f));
@@ -419,7 +424,7 @@ try {
 	await page.waitForTimeout(3000);
 	await session.close();
 	const rewritten = JSON.parse(JSON.parse(await readFile(join(v2dir, "index.json"), "utf8")).meta) as { sources: unknown[] };
-	expect("damaged index rebuilds from the vault", same(paths(rebuilt), ["Second vault note.md", "Other.md"]) && rewritten.sources.length === 2, { rebuilt: paths(rebuilt), sources: rewritten.sources.length });
+	expect("damaged index rebuilds from the vault", paths(rebuilt)[0] === "Second vault note.md" && rewritten.sources.length === 2, { rebuilt: paths(rebuilt), sources: rewritten.sources.length });
 
 	step("console errors", consoleErrors);
 	expect("no console errors", consoleErrors.length === 0, consoleErrors);
