@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { type Browser, chromium, type Page } from "playwright-core";
+import { ENCODER } from "../../src/core/encoder-spec.ts";
+import { acquireModel } from "../../src/plugin/model-files.ts";
 
 const OBSIDIAN = "/Applications/Obsidian.app/Contents/MacOS/Obsidian";
 const USER_OBSIDIAN = join(homedir(), "Library", "Application Support", "obsidian");
@@ -17,7 +19,7 @@ export interface LiveRoot {
 }
 
 export function liveRoot(root: string): LiveRoot {
-	return { root, userData: join(root, "userdata"), vault: join(root, "vault"), dataDir: join(root, "dowse-data"), modelSource: join(process.cwd(), "dev-assets", "e5-small-v2") };
+	return { root, userData: join(root, "userdata"), vault: join(root, "vault"), dataDir: join(root, "dowse-data"), modelSource: join(process.cwd(), "dev-assets", "model") };
 }
 
 export interface UserGuard {
@@ -55,6 +57,11 @@ export async function prepare(live: LiveRoot, { fresh, plugin: withPlugin = true
 	await writeFile(join(live.vault, ".obsidian", "community-plugins.json"), JSON.stringify(["dowse"]));
 }
 
+export async function installModel(live: LiveRoot): Promise<void> {
+	const result = await acquireModel({ kind: "folder", dir: live.modelSource }, live.dataDir, ENCODER, new AbortController().signal, () => {});
+	if (result.kind !== "installed") throw new Error(`model install: ${JSON.stringify(result)}`);
+}
+
 export async function writeFixture(live: LiveRoot): Promise<void> {
 	execFileSync("node", ["scripts/make-fixture-vault.ts", join(live.root, "fixture")], { stdio: "ignore" });
 	await cp(join(live.root, "fixture"), live.vault, { recursive: true });
@@ -77,12 +84,17 @@ export interface Session {
 
 export const OFFLINE_ARGS = ["--proxy-server=127.0.0.1:9", "--host-resolver-rules=MAP * ~NOTFOUND"];
 
-export async function launch(live: LiveRoot, port: number, extraArgs: readonly string[] = [], { scratchData = true }: { scratchData?: boolean } = {}): Promise<Session> {
+export async function launch(
+	live: LiveRoot,
+	port: number,
+	extraArgs: readonly string[] = [],
+	{ scratchData = true, env = {} }: { scratchData?: boolean; env?: Record<string, string> } = {},
+): Promise<Session> {
 	await killStrays(live);
 	const launchedAt = Date.now();
-	const { DOWSE_DATA_DIR: _, ...inherited } = process.env;
+	const { DOWSE_DATA_DIR: _, DOWSE_MODEL_BASE_URL: __, DOWSE_IDLE_MS: ___, ...inherited } = process.env;
 	const child = spawn(OBSIDIAN, [`--user-data-dir=${live.userData}`, `--remote-debugging-port=${port}`, ...extraArgs], {
-		env: scratchData ? { ...inherited, DOWSE_DATA_DIR: live.dataDir } : inherited,
+		env: { ...inherited, ...(scratchData ? { DOWSE_DATA_DIR: live.dataDir } : {}), ...env },
 		stdio: "ignore",
 	});
 	let browser: Browser | null = null;
@@ -130,6 +142,18 @@ export async function waitForLabel(page: Page, labels: string[], timeout = 12000
 	return Date.now() - started;
 }
 
+export function rendererPids(live: LiveRoot): string[] {
+	return execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" })
+		.split("\n")
+		.filter((l) => l.includes(live.userData) && l.includes("--type=renderer"))
+		.map((l) => l.trim().split(" ")[0]!);
+}
+
+export function footprint(live: LiveRoot): { footprintMb: number; peakMb: number } {
+	const all: Record<string, { footprintMb: number; peakMb: number }> = JSON.parse(execFileSync("python3", ["-I", "scripts/live/footprint.py", ...rendererPids(live)], { encoding: "utf8" }));
+	return Object.values(all).reduce((a, b) => ({ footprintMb: a.footprintMb + b.footprintMb, peakMb: a.peakMb + b.peakMb }), { footprintMb: 0, peakMb: 0 });
+}
+
 export async function openAndWait(session: Session, { trust = false, label = "ready", timeout = 300000 }: { trust?: boolean; label?: string; timeout?: number } = {}): Promise<number> {
 	const { page } = session;
 	const started = Date.now();
@@ -146,8 +170,55 @@ export const statusOf = (page: Page) =>
 		return { label: el?.dataset.label ?? "", text: el?.textContent ?? "" };
 	});
 
-export const engineStatus = (page: Page): Promise<{ model: { kind: string }; coverage: { embeddedSources: number; totalSources: number }; passageInferences: number }> =>
-	page.evaluate(() => (window as any).app.plugins.plugins.dowse.status);
+export interface StatusSnapshot {
+	model: { kind: string; message?: string; retry?: string; doneBytes?: number; totalBytes?: number };
+	coverage: { embeddedSources: number; totalSources: number };
+	counters: { passageInferences: number; queryInferences: number; sessionsCreated: number; sessionsLive: number; slowestPassageMs: number; passageMsHistogram: number[] };
+	passageInferences: number;
+}
+
+export const engineStatus = (page: Page): Promise<StatusSnapshot> =>
+	page.evaluate(() => {
+		const status = (window as any).app.plugins.plugins.dowse.status;
+		return { ...status, passageInferences: status.counters.passageInferences };
+	});
+
+// A background test window never gets OS focus, so Obsidian's activeWindow stays on its hidden
+// Settings window, where a modal would open. A person clicking the pane has already focused it.
+export async function focusMain(page: Page): Promise<void> {
+	await page.evaluate(() => window.dispatchEvent(new FocusEvent("focus")));
+}
+
+export async function openSetup(page: Page): Promise<void> {
+	await focusMain(page);
+	if (await page.locator(".dowse-action").isVisible()) await page.locator(".dowse-action").click();
+	else await page.evaluate(() => (window as any).app.commands.executeCommandById("dowse:set-up"));
+	await page.waitForSelector(".dowse-setup .dowse-setup-state", { state: "attached", timeout: 10000 });
+}
+
+export const setupState = (page: Page): Promise<{ label: string; text: string }> =>
+	page.evaluate(() => {
+		const el = document.querySelector(".dowse-setup .dowse-setup-state") as HTMLElement | null;
+		const line = el?.querySelector(".dowse-setup-line")?.textContent;
+		return { label: el?.dataset.label ?? "", text: line ?? el?.textContent ?? "" };
+	});
+
+export async function waitForSetup(page: Page, done: (state: { label: string; text: string }) => boolean, timeout = 120000): Promise<{ label: string; text: string }> {
+	const started = Date.now();
+	for (;;) {
+		const state = await setupState(page);
+		if (done(state)) return state;
+		if (Date.now() - started > timeout) throw new Error(`setup did not settle: ${JSON.stringify(state)}`);
+		await page.waitForTimeout(50);
+	}
+}
+
+export async function importInSetup(page: Page, folder: string): Promise<void> {
+	await page.locator(".dowse-setup input[type=text]").fill(folder);
+	await page.locator(".dowse-setup button", { hasText: "Import" }).click();
+}
+
+export const closeModal = (page: Page) => page.keyboard.press("Escape");
 
 export interface Span {
 	start: { line: number; column: number };
