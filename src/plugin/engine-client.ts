@@ -1,16 +1,17 @@
 import WORKER_SOURCE from "virtual:worker-source";
 import type { Coverage, IndexGeneration, ModelState, ParsedQuery, QueryGeneration, SearchResponse } from "../core/types.ts";
-import type { FromWorker, ToWorker } from "../worker/protocol.ts";
+import type { Counters, FromWorker, ToWorker } from "../worker/protocol.ts";
 
 export interface EngineStatus {
 	readonly model: ModelState;
 	readonly coverage: Coverage;
 	readonly indexGeneration: IndexGeneration;
-	readonly passageInferences: number;
+	readonly counters: Counters;
 }
 
 export interface EngineClientOptions {
 	readonly onSnapshot: (meta: string, vectors: Float32Array) => void;
+	readonly onNeedModel: () => void;
 }
 
 export class EngineClient {
@@ -20,18 +21,33 @@ export class EngineClient {
 	private waiting: { readonly generation: number; readonly resolve: (response: SearchResponse | null) => void } | null = null;
 	private disposed: (() => void) | null = null;
 	private probing: ((result: { ids: readonly (readonly number[])[]; vectors: readonly Float32Array[] }) => void) | null = null;
-	status: EngineStatus = { model: { kind: "model-needed" }, coverage: { embeddedSources: 0, totalSources: 0 }, indexGeneration: 0 as IndexGeneration, passageInferences: 0 };
+	private crashed = false;
+	status: EngineStatus = {
+		model: { kind: "model-needed" },
+		coverage: { embeddedSources: 0, totalSources: 0 },
+		indexGeneration: 0 as IndexGeneration,
+		counters: { passageInferences: 0, queryInferences: 0, sessionsCreated: 0, sessionsLive: 0, slowestPassageMs: 0, passageMsHistogram: [] },
+	};
 
 	constructor(options: EngineClientOptions) {
 		const url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
 		this.worker = new Worker(url, { name: "dowse-engine" });
 		URL.revokeObjectURL(url);
+		this.worker.addEventListener("error", (event) => {
+			event.preventDefault();
+			this.crashed = true;
+			this.cancel();
+			this.setStatus({ ...this.status, model: { kind: "failed", message: `The search engine stopped unexpectedly: ${event.message || "unknown error"}`, retry: "restart" } });
+		});
 		this.worker.addEventListener("message", (event: MessageEvent<FromWorker>) => {
+			if (this.crashed) return;
 			const message = event.data;
 			switch (message.type) {
 				case "state":
-					this.status = { model: message.model, coverage: message.coverage, indexGeneration: message.indexGeneration, passageInferences: message.passageInferences };
-					for (const listener of this.listeners) listener(this.status);
+					this.setStatus({ model: message.model, coverage: message.coverage, indexGeneration: message.indexGeneration, counters: message.counters });
+					return;
+				case "need-model":
+					options.onNeedModel();
 					return;
 				case "response":
 					if (this.waiting?.generation === message.response.generation) {
@@ -57,6 +73,11 @@ export class EngineClient {
 		});
 	}
 
+	private setStatus(status: EngineStatus): void {
+		this.status = status;
+		for (const listener of this.listeners) listener(status);
+	}
+
 	post(message: ToWorker, transfer: Transferable[] = []): void {
 		this.worker.postMessage(message, transfer);
 	}
@@ -75,6 +96,7 @@ export class EngineClient {
 
 	search(query: ParsedQuery, limit: number): Promise<SearchResponse | null> {
 		this.cancel();
+		if (this.crashed) return Promise.resolve(null);
 		const generation = ++this.generation;
 		return new Promise((resolve) => {
 			this.waiting = { generation, resolve };
@@ -90,6 +112,7 @@ export class EngineClient {
 	async dispose(): Promise<void> {
 		this.cancel();
 		this.listeners.clear();
+		if (this.crashed) return this.worker.terminate();
 		const acknowledged = new Promise<void>((resolve) => (this.disposed = resolve));
 		this.post({ type: "dispose" });
 		await Promise.race([acknowledged, new Promise((resolve) => setTimeout(resolve, 2000))]);

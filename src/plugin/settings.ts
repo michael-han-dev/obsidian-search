@@ -1,5 +1,5 @@
 import { type App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
-import { E5_SMALL_V2 } from "../core/encoder-spec.ts";
+import { ENCODER } from "../core/encoder-spec.ts";
 import { conceptLabel } from "../core/types.ts";
 import type DowsePlugin from "./main.ts";
 
@@ -30,7 +30,6 @@ class ConfirmDelete extends Modal {
 
 export class DowseSettingTab extends PluginSettingTab {
 	private readonly plugin: DowsePlugin;
-	private folder = "";
 
 	constructor(app: App, plugin: DowsePlugin) {
 		super(app, plugin);
@@ -45,26 +44,14 @@ export class DowseSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl).setName("Model").setHeading();
 		new Setting(containerEl)
-			.setName("Candidate encoder")
-			.setDesc(`${E5_SMALL_V2.id} at revision ${E5_SMALL_V2.revision.slice(0, 7)}, ${E5_SMALL_V2.license} license, ${Math.round(E5_SMALL_V2.model.bytes / 1e6)} MB. Status: ${label}.`);
-		const canImport = this.plugin.canImport;
-		const importSetting = new Setting(containerEl)
-			.setName("Import from folder")
-			.setDesc(
-				canImport
-					? `A folder containing ${E5_SMALL_V2.model.name} and ${E5_SMALL_V2.vocab.name}. Dowse checks both files against their published checksums before using them.`
-					: `A folder containing ${E5_SMALL_V2.model.name} and ${E5_SMALL_V2.vocab.name}. Restart the plugin after deleting local data, then import.`,
-			)
-			.addText((text) => text.setPlaceholder("/path/to/e5-small-v2").setValue(this.folder).onChange((value) => (this.folder = value.trim())));
-		importSetting.addButton((button) =>
-			button.setButtonText("Import").setDisabled(!canImport).onClick(async () => {
-				button.setDisabled(true);
-				const error = await this.plugin.importModelFrom(this.folder, (done, total) => button.setButtonText(`${Math.round((100 * done) / total)}%`));
-				button.setDisabled(false).setButtonText("Import");
-				new Notice(error ?? "Model imported. Dowse is loading it now.");
-				this.display();
-			}),
-		);
+			.setName("Concept search model")
+			.setDesc(`${ENCODER.id} at revision ${ENCODER.revision.slice(0, 7)}, ${ENCODER.license} license, ${Math.round((ENCODER.model.bytes + ENCODER.vocab.bytes) / 1e6)} MB. Status: ${label}.`)
+			.addButton((b) =>
+				b
+					.setButtonText(label === "model-needed" || label === "failed" ? "Set up concept search" : "Show setup")
+					.setDisabled(!this.plugin.canSetUp)
+					.onClick(() => this.plugin.openSetup()),
+			);
 
 		new Setting(containerEl).setName("Local data").setHeading();
 		new Setting(containerEl)
@@ -74,7 +61,14 @@ export class DowseSettingTab extends PluginSettingTab {
 				button
 					.setButtonText("Delete local data")
 					.setWarning()
-					.onClick(() => new ConfirmDelete(this.app, () => void this.plugin.deleteLocalData().then(() => this.display())).open()),
+					.onClick(() =>
+						new ConfirmDelete(this.app, () =>
+							void this.plugin.deleteLocalData().then(() => {
+								new Notice("Dowse deleted its local index and model files. Restart the plugin to start over.");
+								this.display();
+							}),
+						).open(),
+					),
 			);
 	}
 }

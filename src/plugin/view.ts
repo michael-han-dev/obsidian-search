@@ -45,7 +45,7 @@ function summaryOf(outcome: SearchOutcome, shown: number): string | null {
 			const { embeddedSources, totalSources } = outcome.coverage;
 			if (totalSources === 0) return "No notes match these filters.";
 			const partial = embeddedSources < totalSources ? ` Searched ${embeddedSources} of ${totalSources} notes; the rest are still indexing.` : "";
-			return (shown === 0 ? "No matching notes yet." : "") + partial || null;
+			return ((shown === 0 ? "No strong matches." : "") + partial).trim() || null;
 		}
 		case "empty":
 		case "not-ready":
@@ -58,8 +58,8 @@ function summaryOf(outcome: SearchOutcome, shown: number): string | null {
 }
 
 const LABEL_TEXT: Record<ConceptLabel, string> = {
-	"model-needed": "Concept search needs a model. Import it in Dowse settings.",
-	acquiring: "Importing the model…",
+	"model-needed": "Concept search needs a one-time model setup. Filters already work.",
+	acquiring: "Getting the model…",
 	loading: "Loading the model…",
 	indexing: "Indexing notes…",
 	ready: "Ready.",
@@ -67,10 +67,17 @@ const LABEL_TEXT: Record<ConceptLabel, string> = {
 	disabled: "Concept search is disabled.",
 };
 
+const ACTION_TEXT: Partial<Record<ConceptLabel, string>> = {
+	"model-needed": "Set up concept search",
+	acquiring: "Show progress",
+	failed: "Retry",
+};
+
 export class DowseView extends ItemView {
 	private readonly plugin: DowsePlugin;
 	private input!: HTMLInputElement;
 	private statusEl!: HTMLElement;
+	private actionEl!: HTMLButtonElement;
 	private summaryEl!: HTMLElement;
 	private resultsEl!: HTMLElement;
 	private timer: number | null = null;
@@ -104,6 +111,8 @@ export class DowseView extends ItemView {
 		root.addClass("dowse-view");
 		this.input = root.createEl("input", { type: "search", cls: "dowse-input", attr: { placeholder: "Search by meaning, or filter with tag:, path:, file:", "aria-label": "Search by meaning" } });
 		this.statusEl = root.createDiv({ cls: "dowse-status" });
+		this.actionEl = root.createEl("button", { cls: "dowse-action" });
+		this.registerDomEvent(this.actionEl, "click", () => (this.lastLabel === "failed" ? void this.plugin.retry() : this.plugin.openSetup()));
 		this.summaryEl = root.createDiv({ cls: "dowse-summary" });
 		this.resultsEl = root.createDiv({ cls: "dowse-results" });
 		this.registerDomEvent(this.input, "input", (event) => this.schedule(event.timeStamp));
@@ -140,13 +149,16 @@ export class DowseView extends ItemView {
 	private showStatus(status: EngineStatus): void {
 		const label = conceptLabel(status.model, status.coverage);
 		const { embeddedSources, totalSources } = status.coverage;
-		const detail = status.model.kind === "failed" ? ` ${status.model.message}` : "";
+		const detail = status.model.kind === "failed" ? ` ${status.model.message}` : status.model.kind === "acquiring" ? ` ${Math.round(status.model.doneBytes / 1e6)} of ${Math.round(status.model.totalBytes / 1e6)} MB.` : "";
 		const coverage = label === "indexing" || label === "ready" ? ` ${embeddedSources} of ${totalSources} notes searchable.` : "";
 		this.statusEl.setText(LABEL_TEXT[label] + detail + coverage);
 		this.statusEl.dataset.label = label;
+		const action = ACTION_TEXT[label];
+		this.actionEl.setText(action ?? "");
+		this.actionEl.toggle(action !== undefined);
 		const becameSearchable = (label === "ready" || label === "indexing") && this.lastLabel !== label;
 		this.lastLabel = label;
-		if (becameSearchable && this.input.value.trim() !== "") void this.run();
+		if (becameSearchable && this.resultsEl.dataset.kind === "not-ready" && this.input.value.trim() !== "") void this.run();
 	}
 
 	private render(outcome: SearchOutcome, text: string, inputAt: number): void {

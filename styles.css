@@ -60,3 +60,12 @@
 	-webkit-box-orient: vertical;
 	overflow: hidden;
 }
+
+.dowse-setup .dowse-progress {
+	width: 100%;
+}
+
+.dowse-setup .dowse-facts dd {
+	margin: 0 0 var(--size-4-2) var(--size-4-4);
+	color: var(--text-muted);
+}

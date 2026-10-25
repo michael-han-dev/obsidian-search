@@ -1,17 +1,20 @@
-import { type CachedMetadata, FileSystemAdapter, getAllTags, Notice, parseFrontMatterAliases, Plugin, type TAbstractFile, TFile } from "obsidian";
-import { E5_SMALL_V2 } from "../core/encoder-spec.ts";
+import { type CachedMetadata, FileSystemAdapter, getAllTags, parseFrontMatterAliases, Plugin, type TAbstractFile, TFile } from "obsidian";
+import { ENCODER } from "../core/encoder-spec.ts";
 import { noteMetadata } from "../core/metadata.ts";
 import { parseQuery } from "../core/query.ts";
 import { type NoteMetadata, type SearchOutcome, type SourceFile, VAULT_COLLECTION } from "../core/types.ts";
 import { EngineClient, type EngineStatus } from "./engine-client.ts";
-import { importModel, loadInstalledModel } from "./model-files.ts";
+import { type AbortReason, acquireModel, hasInstalledFiles, loadInstalledModel, type ModelSource } from "./model-files.ts";
 import { DowseSettingTab } from "./settings.ts";
+import { SetupModal } from "./setup.ts";
 import { dataRoot, deleteAllLocalData, readIndex, vaultIndexDir, writeIndex } from "./storage.ts";
 import { DowseView, VIEW_TYPE } from "./view.ts";
 
 const SYNC_DELAY_MS = 300;
 const SYNC_MAX_DELAY_MS = 2000;
 const RECONCILE_MIN_MS = 30_000;
+const IDLE_RELEASE_MS = 300_000;
+const PROGRESS_EVERY_MS = 100;
 
 const stamp = (file: TFile) => `${file.stat.mtime}:${file.stat.size}`;
 
@@ -24,10 +27,21 @@ function metadataOf(cache: CachedMetadata | null): NoteMetadata {
 	});
 }
 
+type Setup =
+	| { readonly kind: "idle" }
+	| { readonly kind: "acquiring"; readonly source: ModelSource; readonly doneBytes: number; readonly totalBytes: number; readonly controller: AbortController }
+	| { readonly kind: "checking" }
+	| { readonly kind: "failed"; readonly source: ModelSource; readonly message: string };
+
 export default class DowsePlugin extends Plugin {
 	readonly root = dataRoot();
+	readonly download: ModelSource = { kind: "download", baseUrl: process.env.DOWSE_MODEL_BASE_URL ?? "https://huggingface.co" };
+	readonly idleMs = Number(process.env.DOWSE_IDLE_MS) || IDLE_RELEASE_MS;
 	private client: EngineClient | null = null;
 	private indexDir: string | null = null;
+	private setup: Setup = { kind: "checking" };
+	private setupModal: SetupModal | null = null;
+	private lastProgress = 0;
 	private readonly statusListeners = new Set<(status: EngineStatus) => void>();
 	private readonly dirty = new Set<string>();
 	private dirtySince = 0;
@@ -39,12 +53,15 @@ export default class DowsePlugin extends Plugin {
 	override async onload(): Promise<void> {
 		this.registerView(VIEW_TYPE, (leaf) => new DowseView(leaf, this));
 		this.addCommand({ id: "open-search", name: "Open concept search", callback: () => void this.activateView() });
+		this.addCommand({ id: "set-up", name: "Set up concept search", callback: () => this.openSetup() });
 		this.addRibbonIcon("telescope", "Open Dowse concept search", () => void this.activateView());
 		this.addSettingTab(new DowseSettingTab(this.app, this));
 		this.app.workspace.onLayoutReady(() => void this.start());
 	}
 
 	override async onunload(): Promise<void> {
+		if (this.setup.kind === "acquiring") this.setup.controller.abort("unload" satisfies AbortReason);
+		this.setupModal?.close();
 		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
 		this.flushTimer = null;
 		this.dirty.clear();
@@ -55,17 +72,35 @@ export default class DowsePlugin extends Plugin {
 	}
 
 	get status(): EngineStatus | null {
-		return this.client?.status ?? null;
+		const base = this.client?.status;
+		if (!base) return null;
+		const setup = this.setup;
+		if (setup.kind === "acquiring") return { ...base, model: { kind: "acquiring", doneBytes: setup.doneBytes, totalBytes: setup.totalBytes } };
+		if (base.model.kind !== "model-needed") return base;
+		if (setup.kind === "checking") return { ...base, model: { kind: "loading" } };
+		if (setup.kind === "failed") return { ...base, model: { kind: "failed", message: setup.message, retry: "acquire" } };
+		return base;
 	}
 
-	get canImport(): boolean {
+	get canSetUp(): boolean {
 		return this.client !== null;
 	}
 
 	onStatus(listener: (status: EngineStatus) => void): () => void {
 		this.statusListeners.add(listener);
-		if (this.client) listener(this.client.status);
+		const status = this.status;
+		if (status) listener(status);
 		return () => this.statusListeners.delete(listener);
+	}
+
+	private emit(): void {
+		const status = this.status;
+		if (status) for (const listener of this.statusListeners) listener(status);
+	}
+
+	private setSetup(setup: Setup): void {
+		this.setup = setup;
+		this.emit();
 	}
 
 	search(text: string, limit: number): Promise<SearchOutcome | null> {
@@ -73,6 +108,12 @@ export default class DowsePlugin extends Plugin {
 		if (parsed.ok) return this.client?.search(parsed.query, limit) ?? Promise.resolve(null);
 		this.client?.cancel();
 		return Promise.resolve({ kind: "invalid", error: parsed.error });
+	}
+
+	openSetup(): void {
+		if (this.setupModal) return;
+		this.setupModal = new SetupModal(this.app, this, () => (this.setupModal = null));
+		this.setupModal.open();
 	}
 
 	async activateView(): Promise<void> {
@@ -90,15 +131,6 @@ export default class DowsePlugin extends Plugin {
 		const adapter = this.app.vault.adapter;
 		if (!(adapter instanceof FileSystemAdapter)) return;
 		this.indexDir = await vaultIndexDir(this.root, adapter.getBasePath());
-		const indexDir = this.indexDir;
-		const client = new EngineClient({ onSnapshot: (meta, vectors) => void writeIndex(indexDir, meta, vectors) });
-		this.client = client;
-		client.onStatus((status) => {
-			for (const listener of this.statusListeners) listener(status);
-		});
-		const saved = await readIndex(indexDir);
-		if (saved) client.post({ type: "restore", meta: saved.meta, vectors: saved.vectors }, [saved.vectors.buffer]);
-		await this.loadModel();
 		// "changed" carries Obsidian's parse of the new text, so there is no modify handler.
 		this.registerEvent(this.app.metadataCache.on("changed", (file) => this.touch(file.path)));
 		this.registerEvent(this.app.vault.on("create", (file) => this.touchAll(file, file.path)));
@@ -110,14 +142,95 @@ export default class DowsePlugin extends Plugin {
 			}),
 		);
 		this.registerDomEvent(window, "focus", () => this.reconcile());
-		this.serial(() => this.syncAll());
+		await this.startEngine();
 	}
 
-	private async loadModel(): Promise<boolean> {
-		const installed = await loadInstalledModel(this.root, E5_SMALL_V2);
-		if (!("model" in installed) || !this.client) return false;
-		this.client.post({ type: "load-model", model: installed.model, vocab: installed.vocab }, [installed.model.buffer]);
-		return true;
+	private async startEngine(): Promise<void> {
+		const indexDir = this.indexDir;
+		if (!indexDir) return;
+		const client = new EngineClient({ onSnapshot: (meta, vectors) => void writeIndex(indexDir, meta, vectors), onNeedModel: () => void this.loadModel() });
+		this.client = client;
+		client.onStatus((status) => {
+			if (this.setup.kind === "checking" && status.model.kind !== "model-needed") this.setup = { kind: "idle" };
+			this.emit();
+		});
+		const saved = await readIndex(indexDir);
+		if (saved) client.post({ type: "restore", meta: saved.meta, vectors: saved.vectors }, [saved.vectors.buffer]);
+		this.serial(() => this.syncAll());
+		await this.loadModel();
+	}
+
+	private async restartEngine(): Promise<void> {
+		const client = this.client;
+		this.client = null;
+		await client?.dispose();
+		await this.startEngine();
+	}
+
+	private async loadModel(): Promise<void> {
+		const client = this.client;
+		if (!client) return;
+		const installed = await loadInstalledModel(this.root, ENCODER);
+		if (client !== this.client) return;
+		if ("model" in installed) {
+			client.post({ type: "load-model", model: installed.model, vocab: installed.vocab, idleMs: this.idleMs }, [installed.model.buffer]);
+			return;
+		}
+		client.post({ type: "model-unavailable" });
+		if (await hasInstalledFiles(this.root, ENCODER)) {
+			this.setSetup({ kind: "failed", source: this.download, message: `The model files on this computer did not pass verification: ${installed.message}. Set up again to replace them.` });
+		} else if (this.setup.kind === "checking") {
+			this.setSetup({ kind: "idle" });
+		}
+	}
+
+	async acquire(source: ModelSource): Promise<void> {
+		if (this.setup.kind === "acquiring" || !this.client) return;
+		const controller = new AbortController();
+		const totalBytes = ENCODER.model.bytes + ENCODER.vocab.bytes;
+		this.setSetup({ kind: "acquiring", source, doneBytes: 0, totalBytes, controller });
+		const result = await acquireModel(source, this.root, ENCODER, controller.signal, (doneBytes) => {
+			const setup = this.setup;
+			if (setup.kind !== "acquiring" || !this.acquiringWith(controller)) return;
+			this.setup = { ...setup, doneBytes };
+			if (Date.now() - this.lastProgress < PROGRESS_EVERY_MS && doneBytes < totalBytes) return;
+			this.lastProgress = Date.now();
+			this.emit();
+		});
+		if (!this.acquiringWith(controller)) return;
+		if (result.kind === "installed") {
+			this.setSetup({ kind: "checking" });
+			await this.loadModel();
+		} else if (result.kind === "cancelled") {
+			this.setSetup({ kind: "idle" });
+		} else {
+			this.setSetup({ kind: "failed", source, message: result.message });
+		}
+	}
+
+	private acquiringWith(controller: AbortController): boolean {
+		return this.setup.kind === "acquiring" && this.setup.controller === controller;
+	}
+
+	cancelSetup(): void {
+		if (this.setup.kind === "acquiring") this.setup.controller.abort("cancel" satisfies AbortReason);
+	}
+
+	async retry(): Promise<void> {
+		const model = this.status?.model;
+		if (model?.kind !== "failed") return;
+		switch (model.retry) {
+			case "acquire":
+				return this.acquire(this.setup.kind === "failed" ? this.setup.source : this.download);
+			case "load":
+				return this.loadModel();
+			case "restart":
+				return this.restartEngine();
+			default: {
+				const unhandled: never = model.retry;
+				return unhandled;
+			}
+		}
 	}
 
 	private async readSource(file: TFile): Promise<{ source: SourceFile; stamp: string }> {
@@ -190,17 +303,12 @@ export default class DowsePlugin extends Plugin {
 		for (const path of this.sent.keys()) if (!present.has(path)) this.touch(path);
 	}
 
-	async importModelFrom(folder: string, onProgress: (done: number, total: number) => void): Promise<string | null> {
-		const result = await importModel(folder, this.root, E5_SMALL_V2, onProgress);
-		if (!result.ok) return result.message;
-		await this.loadModel();
-		return null;
-	}
-
 	async deleteLocalData(): Promise<void> {
-		await this.client?.dispose();
+		this.cancelSetup();
+		const client = this.client;
 		this.client = null;
+		await client?.dispose();
 		await deleteAllLocalData(this.root);
-		new Notice("Dowse deleted its local index and model files. Restart the plugin to start over.");
+		this.setup = { kind: "checking" };
 	}
 }
