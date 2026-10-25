@@ -16,18 +16,12 @@ const virtual = (modules: Record<string, () => Promise<string>>): Plugin => ({
 
 const wasmGzipBase64 = async () => gzipSync(await readFile("node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm"), { level: 9 }).toString("base64");
 
-const worker = await build({
-	entryPoints: ["src/worker/main.ts"],
-	bundle: true,
-	format: "iife",
-	platform: "browser",
-	target: "es2022",
-	minify: true,
-	write: false,
-	logLevel: "warning",
-	plugins: [virtual({ "virtual:ort-wasm": wasmGzipBase64 })],
-});
-const workerSource = worker.outputFiles[0]!.text;
+const bundleWorker = async (entry: string, modules: Record<string, () => Promise<string>>): Promise<string> => {
+	const result = await build({ entryPoints: [entry], bundle: true, format: "iife", platform: "browser", target: "es2022", minify: true, write: false, logLevel: "warning", plugins: [virtual(modules)] });
+	return result.outputFiles[0]!.text;
+};
+const encoderSource = await bundleWorker("src/worker/encoder-main.ts", { "virtual:ort-wasm": wasmGzipBase64 });
+const workerSource = await bundleWorker("src/worker/main.ts", { "virtual:encoder-source": async () => encoderSource });
 
 await mkdir("dist", { recursive: true });
 await build({
@@ -45,4 +39,4 @@ await build({
 await copyFile("manifest.json", "dist/manifest.json");
 await copyFile("styles.css", "dist/styles.css");
 for (const name of ["main.js", "manifest.json", "styles.css"]) console.log(`dist/${name} ${(await stat(`dist/${name}`)).size} bytes`);
-console.log(`worker bundle ${Buffer.byteLength(workerSource)} bytes`);
+console.log(`engine worker ${Buffer.byteLength(workerSource)} bytes, encoder worker ${Buffer.byteLength(encoderSource)} bytes`);

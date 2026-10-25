@@ -95,12 +95,15 @@ export interface Coverage {
 	readonly totalSources: number;
 }
 
+export type Recovery = "acquire" | "load" | "restart";
+
 export type ModelState =
 	| { readonly kind: "model-needed" }
 	| { readonly kind: "acquiring"; readonly doneBytes: number; readonly totalBytes: number }
 	| { readonly kind: "loading" }
 	| { readonly kind: "loaded" }
-	| { readonly kind: "failed"; readonly message: string }
+	| { readonly kind: "released" }
+	| { readonly kind: "failed"; readonly message: string; readonly retry: Recovery }
 	| { readonly kind: "disabled" };
 
 export type ConceptLabel = "model-needed" | "acquiring" | "loading" | "indexing" | "ready" | "failed" | "disabled";
@@ -108,6 +111,7 @@ export type ConceptLabel = "model-needed" | "acquiring" | "loading" | "indexing"
 export function conceptLabel(model: ModelState, coverage: Coverage): ConceptLabel {
 	switch (model.kind) {
 		case "loaded":
+		case "released":
 			return coverage.embeddedSources < coverage.totalSources ? "indexing" : "ready";
 		case "model-needed":
 		case "acquiring":
