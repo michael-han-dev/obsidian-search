@@ -94,7 +94,7 @@ export const LONG_LINE = "word ".repeat(300).trim();
 export const SHAPE_NOTES: Readonly<Record<string, string>> = {
 	"Shapes/Code and long.md": `# Shapes\n\nfirst paragraph\n\nsecond paragraph\n\n\`\`\`\nconst a = 1;\n\nconst b = 2;\n\`\`\`\n\nshort line\n${LONG_LINE}\n`,
 };
-export const SHAPE_PASSAGES = ["first paragraph\n\nsecond paragraph\n\n```\nconst a = 1;\n\nconst b = 2;\n```\n\nshort line", LONG_LINE];
+export const SHAPE_FIRST_PASSAGE = "first paragraph\n\nsecond paragraph\n\n```\nconst a = 1;\n\nconst b = 2;\n```\n\nshort line";
 
 export const SIBLING_NOTES: Readonly<Record<string, string>> = {
 	"Quokka ledger.md": "# Quokka ledger\n\nThe quokka migration ledger lists every island crossing.\n",
