@@ -1,6 +1,6 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { copyFile, cp, mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { type Browser, chromium, type Page } from "playwright-core";
@@ -9,6 +9,29 @@ import { acquireModel } from "../../src/plugin/model-files.ts";
 
 const OBSIDIAN = "/Applications/Obsidian.app/Contents/MacOS/Obsidian";
 const USER_OBSIDIAN = join(homedir(), "Library", "Application Support", "obsidian");
+const CLI_SOCKET = join(homedir(), ".obsidian-cli.sock");
+// Outranks every real release, so Obsidian's loader runs the wrapper and its updater never replaces it.
+const WRAPPER_ASAR = "obsidian-999.0.0.asar";
+// Covered or unfocused test windows must keep running and painting like a window in front.
+const QUIET_FLAGS = ["--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-background-timer-throttling"];
+
+function asarArchive(files: Record<string, Buffer>): Buffer {
+	const entries: Record<string, { size: number; offset: string }> = {};
+	let offset = 0;
+	for (const [name, body] of Object.entries(files)) {
+		entries[name] = { size: body.length, offset: String(offset) };
+		offset += body.length;
+	}
+	const json = Buffer.from(JSON.stringify({ files: entries }));
+	const header = Buffer.alloc(8 + Math.ceil(json.length / 4) * 4);
+	header.writeUInt32LE(header.length - 4, 0);
+	header.writeUInt32LE(json.length, 4);
+	json.copy(header, 8);
+	const size = Buffer.alloc(8);
+	size.writeUInt32LE(4, 0);
+	size.writeUInt32LE(header.length, 4);
+	return Buffer.concat([size, header, ...Object.values(files)]);
+}
 
 export interface LiveRoot {
 	readonly root: string;
@@ -25,6 +48,15 @@ export function liveRoot(root: string): LiveRoot {
 export interface UserGuard {
 	readonly pids: string;
 	readonly configMtime: number;
+	readonly cliSocket: string;
+}
+
+async function newestObsidianAsar(): Promise<string> {
+	const version = (name: string) => name.slice("obsidian-".length, -".asar".length).split(".").map(Number);
+	const byNewest = (a: string, b: string) => version(b).reduce((d, n, i) => d || n - version(a)[i]!, 0);
+	const [newest] = (await readdir(USER_OBSIDIAN)).filter((n) => /^obsidian-\d+\.\d+\.\d+\.asar$/.test(n)).sort(byNewest);
+	if (!newest) throw new Error(`No obsidian-<version>.asar in ${USER_OBSIDIAN}`);
+	return join(USER_OBSIDIAN, newest);
 }
 
 export async function userGuard(live: LiveRoot): Promise<UserGuard> {
@@ -33,7 +65,8 @@ export async function userGuard(live: LiveRoot): Promise<UserGuard> {
 		.filter((line) => line.includes("/Contents/MacOS/Obsidian") && !line.includes(live.userData))
 		.map((line) => line.trim().split(" ")[0])
 		.join(",");
-	return { pids, configMtime: (await stat(join(USER_OBSIDIAN, "obsidian.json"))).mtimeMs };
+	const socket = await stat(CLI_SOCKET).catch(() => null);
+	return { pids, configMtime: (await stat(join(USER_OBSIDIAN, "obsidian.json"))).mtimeMs, cliSocket: socket ? `${socket.ino}:${socket.mtimeMs}` : "absent" };
 }
 
 export async function killStrays(live: LiveRoot): Promise<void> {
@@ -48,7 +81,10 @@ export async function killStrays(live: LiveRoot): Promise<void> {
 export async function prepare(live: LiveRoot, { fresh, plugin: withPlugin = true }: { fresh: boolean; plugin?: boolean }): Promise<void> {
 	if (fresh) for (const dir of [live.userData, live.vault, live.dataDir, join(live.root, "fixture")]) await rm(dir, { recursive: true, force: true });
 	await mkdir(live.userData, { recursive: true });
-	await copyFile(join(USER_OBSIDIAN, "obsidian-1.14.4.asar"), join(live.userData, "obsidian-1.14.4.asar"));
+	for (const name of await readdir(live.userData)) if (/^(real-)?obsidian.*\.asar$/.test(name)) await rm(join(live.userData, name), { force: true });
+	await copyFile(await newestObsidianAsar(), join(live.userData, "real-obsidian.asar"));
+	const files = { "main.js": await readFile("scripts/live/test-obsidian.cjs"), "package.json": Buffer.from('{"type":"commonjs"}') };
+	await writeFile(join(live.userData, WRAPPER_ASAR), asarArchive(files));
 	await writeFile(join(live.userData, "obsidian.json"), JSON.stringify({ vaults: { "0123456789abcdef": { path: live.vault, ts: Date.now(), open: true } } }));
 	if (!withPlugin) return mkdir(join(live.vault, ".obsidian"), { recursive: true }).then(() => {});
 	const plugin = join(live.vault, ".obsidian", "plugins", "dowse");
@@ -93,7 +129,7 @@ export async function launch(
 	await killStrays(live);
 	const launchedAt = Date.now();
 	const { DOWSE_DATA_DIR: _, DOWSE_MODEL_BASE_URL: __, DOWSE_IDLE_MS: ___, ...inherited } = process.env;
-	const child = spawn(OBSIDIAN, [`--user-data-dir=${live.userData}`, `--remote-debugging-port=${port}`, ...extraArgs], {
+	const child = spawn(OBSIDIAN, [`--user-data-dir=${live.userData}`, `--remote-debugging-port=${port}`, ...QUIET_FLAGS, ...extraArgs], {
 		env: { ...inherited, ...(scratchData ? { DOWSE_DATA_DIR: live.dataDir } : {}), ...env },
 		stdio: "ignore",
 	});
@@ -110,16 +146,23 @@ export async function launch(
 	}
 	if (!page) throw new Error("Obsidian opened no vault window");
 	await page.waitForFunction(() => (window as unknown as { app?: { workspace?: { layoutReady?: boolean } } }).app?.workspace?.layoutReady === true, null, { timeout: 30000 });
+	let closing = false;
+	const unexpected = (what: string) => !closing && console.error(`test Obsidian ${what} at ${new Date().toISOString()}`);
+	page.on("crash", () => unexpected("renderer crashed"));
+	page.on("close", () => unexpected("window closed"));
+	child.on("exit", (code, signal) => unexpected(`exited with code ${code}, signal ${signal}`));
 	return {
 		process: child,
 		browser,
 		page,
 		launchedAt,
 		async close() {
+			closing = true;
 			await browser.close().catch(() => {});
 			child.kill("SIGTERM");
 			for (let i = 0; i < 50 && child.exitCode === null && child.signalCode === null; i++) await sleep(100);
 			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await rm(join(tmpdir(), `dowse-test-obsidian-${child.pid}.sock`), { force: true });
 		},
 	};
 }
