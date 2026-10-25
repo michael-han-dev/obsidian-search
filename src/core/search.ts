@@ -7,9 +7,9 @@ export interface IndexedSource {
 	readonly vectors: Float32Array;
 }
 
-export function meanPoolNormalized(hidden: Float32Array, tokens: number, dimensions: number): Float32Array {
+export function poolNormalized(hidden: Float32Array, tokens: number, dimensions: number, pooling: "mean" | "cls"): Float32Array {
 	const pooled = new Float32Array(dimensions);
-	for (let t = 0; t < tokens; t++) {
+	for (let t = 0; t < (pooling === "cls" ? 1 : tokens); t++) {
 		const row = t * dimensions;
 		for (let d = 0; d < dimensions; d++) pooled[d]! += hidden[row + d]!;
 	}

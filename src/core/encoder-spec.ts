@@ -4,6 +4,7 @@ import type { Digest } from "./types.ts";
 
 export interface ModelFile {
 	readonly name: string;
+	readonly path: string;
 	readonly bytes: number;
 	readonly sha256: string;
 }
@@ -19,29 +20,33 @@ export interface EncoderSpec {
 	readonly maxTokens: number;
 	readonly queryPrefix: string;
 	readonly passagePrefix: string;
-	readonly pooling: "mean";
+	readonly output: "last_hidden_state" | "token_embeddings";
+	readonly pooling: "mean" | "cls";
 	readonly normalize: true;
 	readonly lowercase: boolean;
 	readonly precision: "fp32";
 	readonly templateRevision: string;
+	readonly relevanceThreshold: number;
 }
 
-export const E5_SMALL_V2: EncoderSpec = {
-	id: "intfloat/e5-small-v2",
-	revision: "ffb93f3bd4047442299a41ebb6fa998a38507c52",
+export const ENCODER: EncoderSpec = {
+	id: "BAAI/bge-small-en-v1.5",
+	revision: "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
 	license: "MIT",
-	folderName: "intfloat-e5-small-v2-ffb93f3",
-	model: { name: "model.onnx", bytes: 133093468, sha256: "4b8205be2a3c5fc53c6534d76a2012064f7309c162b806f2889c6ec8ec4fdcba" },
-	vocab: { name: "vocab.txt", bytes: 231508, sha256: "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3" },
+	folderName: "BAAI-bge-small-en-v1.5-5c38ec7",
+	model: { name: "model.onnx", path: "onnx/model.onnx", bytes: 133093490, sha256: "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35" },
+	vocab: { name: "vocab.txt", path: "vocab.txt", bytes: 231508, sha256: "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3" },
 	dimensions: 384,
 	maxTokens: 512,
-	queryPrefix: "query: ",
-	passagePrefix: "passage: ",
-	pooling: "mean",
+	queryPrefix: "Represent this sentence for searching relevant passages: ",
+	passagePrefix: "",
+	output: "last_hidden_state",
+	pooling: "cls",
 	normalize: true,
 	lowercase: true,
 	precision: "fp32",
 	templateRevision: "title-aliases-headings@1",
+	relevanceThreshold: 0.53,
 };
 
 export function embeddingFingerprint(spec: EncoderSpec): Promise<Digest> {
@@ -52,7 +57,10 @@ export function embeddingFingerprint(spec: EncoderSpec): Promise<Digest> {
 			spec.model.sha256,
 			spec.vocab.sha256,
 			spec.lowercase,
+			spec.queryPrefix,
+			spec.passagePrefix,
 			spec.templateRevision,
+			spec.output,
 			spec.pooling,
 			spec.normalize,
 			spec.dimensions,
@@ -66,6 +74,14 @@ export function encodeQuery(tokenizer: WordPieceTokenizer, spec: EncoderSpec, te
 	return [tokenizer.clsId, ...body, tokenizer.sepId];
 }
 
-export function inputHash(ids: readonly TokenId[]): Promise<Digest> {
-	return digest(new Uint8Array(Int32Array.from(ids).buffer));
+const KEY_VERSION = new TextEncoder().encode("dowse-embedding-key@1\u0000");
+
+export function embeddingKey(fingerprint: Digest, ids: readonly TokenId[]): Promise<Digest> {
+	const head = new TextEncoder().encode(`${fingerprint}\u0000`);
+	const body = new Uint8Array(Int32Array.from(ids).buffer);
+	const bytes = new Uint8Array(KEY_VERSION.length + head.length + body.length);
+	bytes.set(KEY_VERSION, 0);
+	bytes.set(head, KEY_VERSION.length);
+	bytes.set(body, KEY_VERSION.length + head.length);
+	return digest(bytes);
 }
