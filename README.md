@@ -1,7 +1,7 @@
 # Dowse
 hyper fast local search and more for your obsidian
 
-Dowse is an Obsidian plugin that finds notes by what they mean, not the exact words you typed, and runs entirely on your Mac. It adds a side pane next to native Obsidian Search, which stays the tool for exact keyword lookup. Filters such as `tag:`, `path:`, and quoted text narrow the results before they are ranked by meaning. The first beta searches only the active vault, and each Mac keeps its own index outside the vault. Dowse is an early development build and is not released.
+Dowse is an Obsidian plugin that finds notes by what they mean, not the exact words you typed, and runs entirely on your Mac. It adds a side pane next to native Obsidian Search, which stays the tool for exact keyword lookup. Filters such as `tag:`, `path:`, and quoted text narrow the results before they are ranked by meaning. The first beta searches only the active vault, and each Mac keeps its own index outside the vault. Dowse is an early beta. Install it with [BRAT](https://github.com/TfTHacker/obsidian42-brat) by adding `michael-han-dev/obsidian-search` as a beta plugin, or copy `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/michael-han-dev/obsidian-search/releases) into `<vault>/.obsidian/plugins/dowse/`.
 
 ## Setting up concept search
 
