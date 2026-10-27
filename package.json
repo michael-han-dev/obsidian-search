@@ -12,7 +12,8 @@
     "try": "npm run build && node scripts/live/try.ts",
     "live": "npm run build && node scripts/live/check.ts",
     "load": "npm run build && node scripts/live/load.ts",
-    "setup-real": "npm run build && node scripts/live/setup-real.ts"
+    "setup-real": "npm run build && node scripts/live/setup-real.ts",
+    "release": "node scripts/release.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

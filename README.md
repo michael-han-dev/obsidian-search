@@ -28,6 +28,7 @@ Requires Node 25 and Obsidian 1.14.4 or later in `/Applications`, opened at leas
 - `npm run setup-real` runs a fresh-install setup against huggingface.co. It needs the network.
 - `npm run load -- <label> 1000` measures a 1,000-note generated vault against the latency and memory budgets.
 - `npm run build` writes `main.js`, `manifest.json`, and `styles.css` to `dist/`.
+- `npm run release -- <version> --notes "<text>"` publishes those three files as a GitHub pre-release that BRAT installs. Set the version in `manifest.json`, `package.json`, and `package-lock.json`, then commit and push first. The script builds, refuses a build or notes that contain your home path, username, or git email, uploads, and checks the uploaded files against `dist/`. Add `--dry-run` to stop before publishing and `--stable` for a full release.
 - `npm run try` opens a separate Obsidian on a generated test vault with Dowse and the model installed. `npm run try -- --setup` leaves the model out, so you can walk through setup there first.
 - `scripts/eval/` holds the encoder comparison that chose the model. It needs a Python environment with `onnxruntime`, `tokenizers`, `numpy`, and `pyarrow`.
 
