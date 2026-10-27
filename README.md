@@ -32,4 +32,4 @@ Requires Node 25 and Obsidian 1.14.4 or later in `/Applications`, opened at leas
 - `npm run try` opens a separate Obsidian on a generated test vault with Dowse and the model installed. `npm run try -- --setup` leaves the model out, so you can walk through setup there first.
 - `scripts/eval/` holds the encoder comparison that chose the model. It needs a Python environment with `onnxruntime`, `tokenizers`, `numpy`, and `pyarrow`.
 
-The plugin ID is `dowse`. The plugin code will use the MIT license.
+The plugin ID is `dowse`. The plugin code uses the [MIT license](LICENSE).
