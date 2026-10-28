@@ -3,6 +3,27 @@ hyper fast local search and more for your obsidian
 
 Dowse is an Obsidian plugin that finds notes by what they mean, not the exact words you typed, and runs entirely on your Mac. It adds a side pane next to native Obsidian Search, which stays the tool for exact keyword lookup. Filters such as `tag:`, `path:`, and quoted text narrow the results before they are ranked by meaning. The first beta searches only the active vault, and each Mac keeps its own index outside the vault. Dowse is an early beta. Install it with [BRAT](https://github.com/TfTHacker/obsidian42-brat) by adding `michael-han-dev/obsidian-search` as a beta plugin, or copy `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/michael-han-dev/obsidian-search/releases) into `<vault>/.obsidian/plugins/dowse/`.
 
+```mermaid
+flowchart LR
+  Q[Typed search] --> P[Parse request]
+  P --> F[Filters]
+  P --> T[Meaning text]
+  F --> E[Eligible notes]
+  E -. no meaning text .-> L[Matching notes, no model]
+  T --> QE["Query embedding<br/>bge-small, on device"]
+  N[Vault notes] --> PS["Passages<br/>80 tokens + title, headings"]
+  PS --> PE[Passage embeddings]
+  E --> VS[Exact vector search]
+  QE --> VS
+  PE --> VS
+  VS --> TH[Relevance threshold]
+  TH --> OUT[Notes with best passages]
+```
+
+Filters narrow the eligible notes before anything is ranked, and a search with only filters lists the matching notes without the model. Meaning text is embedded after a 150 ms pause in typing and compared against every indexed passage of the eligible notes. Each note ranks by its best passage, and notes below the relevance threshold are hidden. Passages are embedded in the background as notes change.
+
+You can read about Dowse's progress in the [CHANGELOG](CHANGELOG.md).
+
 ## Setting up concept search
 
 Searches with words need a small language model that runs on your Mac. Filters such as `tag:`, `path:`, and quoted text work without it. Open the Dowse pane and choose **Set up concept search**. Dowse downloads the model once, checks each file against its published SHA-256 checksum, and then indexes your notes. You can search the indexed notes while indexing continues.
