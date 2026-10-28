@@ -51,6 +51,7 @@ const versions: Record<string, string> = {
 	'package-lock.json packages[""]': lock.packages[""].version,
 };
 for (const [where, found] of Object.entries(versions)) if (found !== version) throw new Error(`${where} has version ${found}, not ${version}`);
+if (!(await readFile("CHANGELOG.md", "utf8")).includes(`## [${version}]`)) throw new Error(`CHANGELOG.md has no ## [${version}] section`);
 
 const exists = succeeds("gh", ["release", "view", version]);
 if (exists) {
